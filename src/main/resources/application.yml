@@ -1,0 +1,25 @@
+server:
+  port: 8091
+
+spring:
+  datasource:
+    url: jdbc:mysql://localhost/rockburger_cart
+    username: root
+    password: 12345
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+        dialect: org.hibernate.dialect.MySQL8Dialect
+
+jwt:
+  secret: "9qZgHlZ5Kg+POpcNp1YWlN5F/mkDoYysAaMAzvCydswRhE+tzLXytB/bNiU+NjPiCbKN7UZWFkgtw0wXSDYWQg=="
+  expiration: 3600000
+
+logging:
+  level:
+    org.springframework.security: DEBUG
+    com.rockburger.cartservice: DEBUG
