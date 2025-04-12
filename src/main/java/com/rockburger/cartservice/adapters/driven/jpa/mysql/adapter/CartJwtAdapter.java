@@ -27,10 +27,17 @@ public class CartJwtAdapter implements ICartJwtPersistencePort {
     @Override
     public CartUserModel validateToken(String token) {
         Claims claims = getClaimsFromToken(token);
+        String role = claims.get("role", String.class);
+
+        // Normalize role format between services
+        if (!role.startsWith("ROLE_")) {
+            role = "ROLE_" + role;
+        }
+
         return new CartUserModel(
-                null, // ID is not needed for cart operations
+                null,
                 claims.getSubject(),
-                claims.get("role", String.class)
+                role
         );
     }
 
@@ -71,4 +78,7 @@ public class CartJwtAdapter implements ICartJwtPersistencePort {
             throw new CartTokensException("Invalid token");
         }
     }
+
+
+
 }
