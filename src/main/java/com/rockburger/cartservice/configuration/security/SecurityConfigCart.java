@@ -32,8 +32,9 @@ public class SecurityConfigCart {
                 .antMatchers("/swagger-ui/**",
                         "/v3/api-docs/**",
                         "/swagger-resources/**",
+                        "/actuator/health",
                         "/webjars/**").permitAll()
-                .antMatchers("/cart/**").hasRole("client")
+                .antMatchers("/cart/**").hasAnyRole("client", "auxiliar")
                 .anyRequest().authenticated()
                 .and()
                 .addFilterBefore(jwtCartAuthenticationFilter,

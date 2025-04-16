@@ -7,7 +7,6 @@ import com.rockburger.cartservice.domain.spi.ICartJwtPersistencePort;
 import io.jsonwebtoken.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 @Component
@@ -19,24 +18,40 @@ public class CartJwtAdapter implements ICartJwtPersistencePort {
 
     public CartJwtAdapter(
             JwtCartKeyProvider jwtCartKeyProvider,
-            @Value("${jwt.secret}") String jwtSecret) {
+            String jwtCartSecretKey) {
         this.jwtCartKeyProvider = jwtCartKeyProvider;
-        this.jwtSecret = jwtSecret;
+        this.jwtSecret = jwtCartSecretKey;
     }
 
     @Override
     public CartUserModel validateToken(String token) {
         Claims claims = getClaimsFromToken(token);
+
+        // Extract user details from claims
+        Long userId = null;
+        try {
+            // Handle the case where userId might be an Integer or Long
+            Object userIdObj = claims.get("userId");
+            if (userIdObj instanceof Integer) {
+                userId = ((Integer) userIdObj).longValue();
+            } else if (userIdObj instanceof Long) {
+                userId = (Long) userIdObj;
+            }
+        } catch (Exception e) {
+            logger.warn("Error extracting userId from token: {}", e.getMessage());
+        }
+
         String role = claims.get("role", String.class);
 
         // Normalize role format between services
-        if (!role.startsWith("ROLE_")) {
+        // The main app might use "client" while cart service expects "ROLE_client"
+        if (role != null && !role.startsWith("ROLE_")) {
             role = "ROLE_" + role;
         }
 
         return new CartUserModel(
-                null,
-                claims.getSubject(),
+                userId,
+                claims.getSubject(), // email/username
                 role
         );
     }
@@ -48,7 +63,14 @@ public class CartJwtAdapter implements ICartJwtPersistencePort {
 
     @Override
     public String getUserRoleFromToken(String token) {
-        return getClaimsFromToken(token).get("role", String.class);
+        String role = getClaimsFromToken(token).get("role", String.class);
+
+        // Normalize role format
+        if (role != null && !role.startsWith("ROLE_")) {
+            role = "ROLE_" + role;
+        }
+
+        return role;
     }
 
     @Override
@@ -59,6 +81,9 @@ public class CartJwtAdapter implements ICartJwtPersistencePort {
                     .build()
                     .parseClaimsJws(token);
             return true;
+        } catch (ExpiredJwtException e) {
+            logger.warn("JWT token expired: {}", e.getMessage());
+            return false;
         } catch (JwtException | IllegalArgumentException e) {
             logger.error("JWT token validation failed: {}", e.getMessage());
             return false;
@@ -73,12 +98,11 @@ public class CartJwtAdapter implements ICartJwtPersistencePort {
                     .parseClaimsJws(token)
                     .getBody();
         } catch (ExpiredJwtException e) {
+            logger.error("Token has expired", e);
             throw new CartTokensException("Token has expired");
         } catch (JwtException e) {
-            throw new CartTokensException("Invalid token");
+            logger.error("Invalid token", e);
+            throw new CartTokensException("Invalid token: " + e.getMessage());
         }
     }
-
-
-
 }
