@@ -8,11 +8,15 @@ import org.springframework.security.config.annotation.web.configuration.EnableWe
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @Configuration
 @EnableWebSecurity
 @EnableGlobalMethodSecurity(prePostEnabled = true)
 public class SecurityConfigCart {
+    private static final Logger logger = LoggerFactory.getLogger(SecurityConfigCart.class);
+
     private final JwtCartAuthenticationFilter jwtCartAuthenticationFilter;
 
     public SecurityConfigCart(JwtCartAuthenticationFilter jwtCartAuthenticationFilter) {
@@ -21,6 +25,8 @@ public class SecurityConfigCart {
 
     @Bean
     public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        logger.info("Configuring cart service security");
+
         http
                 .cors().and()
                 .csrf().disable()
@@ -34,6 +40,7 @@ public class SecurityConfigCart {
                         "/swagger-resources/**",
                         "/actuator/health",
                         "/webjars/**").permitAll()
+                // Ensure both client and auxiliar roles can access cart endpoints
                 .antMatchers("/cart/**").hasAnyRole("client", "auxiliar")
                 .anyRequest().authenticated()
                 .and()

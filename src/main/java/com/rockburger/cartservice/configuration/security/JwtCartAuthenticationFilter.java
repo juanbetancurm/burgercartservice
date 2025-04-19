@@ -34,14 +34,41 @@ public class JwtCartAuthenticationFilter extends OncePerRequestFilter {
                                     FilterChain filterChain) throws ServletException, IOException {
         try {
             String jwt = extractJwtFromRequest(request);
+
+            // Enhanced logging for troubleshooting
+            logger.debug("Processing cart service request to: {} with JWT: {}",
+                    request.getRequestURI(), jwt != null ? "present" : "not present");
+
             if (jwt != null && cartJwtPersistencePort.isTokenValid(jwt)) {
                 CartUserModel user = cartJwtPersistencePort.validateToken(jwt);
-                setSecurityContext(user);
-                logger.debug("User authenticated with role: {}", user.getRole());
+
+                // Normalize role format for Spring Security
+                // This ensures consistent role handling between microservices
+                String role = user.getRole();
+                if (role != null && !role.startsWith("ROLE_")) {
+                    role = "ROLE_" + role;
+                }
+
+                List<SimpleGrantedAuthority> authorities = List.of(
+                        new SimpleGrantedAuthority(role)
+                );
+
+                UsernamePasswordAuthenticationToken authentication =
+                        new UsernamePasswordAuthenticationToken(
+                                user.getEmail(),
+                                null,
+                                authorities
+                        );
+
+                SecurityContextHolder.getContext().setAuthentication(authentication);
+                logger.debug("User authenticated in cart service with role: {}", role);
+            } else if (jwt != null) {
+                logger.warn("Invalid JWT token received by cart service");
             }
         } catch (Exception e) {
-            logger.error("Cannot set user authentication", e);
+            logger.error("Cannot set user authentication in cart service: {}", e.getMessage());
         }
+
         filterChain.doFilter(request, response);
     }
 
@@ -51,20 +78,5 @@ public class JwtCartAuthenticationFilter extends OncePerRequestFilter {
             return bearerToken.substring(7);
         }
         return null;
-    }
-
-    private void setSecurityContext(CartUserModel user) {
-        List<SimpleGrantedAuthority> authorities = List.of(
-                new SimpleGrantedAuthority("ROLE_" + user.getRole())
-        );
-
-        UsernamePasswordAuthenticationToken authentication =
-                new UsernamePasswordAuthenticationToken(
-                        user.getEmail(),
-                        null,
-                        authorities
-                );
-
-        SecurityContextHolder.getContext().setAuthentication(authentication);
     }
 }

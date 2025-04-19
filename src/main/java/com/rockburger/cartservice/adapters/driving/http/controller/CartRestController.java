@@ -48,7 +48,7 @@ public class CartRestController {
     @Operation(summary = "Get active cart", description = "Retrieves the active cart for the authenticated user")
     @ApiResponse(responseCode = "200", description = "Cart retrieved successfully")
     @ApiResponse(responseCode = "404", description = "No active cart found")
-    @PreAuthorize("hasRole('client')")
+    @PreAuthorize("hasAnyRole('client', 'auxiliar')")
     public ResponseEntity<CartResponse> getActiveCart(@AuthenticationPrincipal UserDetails userDetails) {
         logger.info("Retrieving active cart for user: {}", userDetails.getUsername());
         return ResponseEntity.ok(
@@ -63,7 +63,7 @@ public class CartRestController {
     @ApiResponse(responseCode = "201", description = "Item added successfully")
     @ApiResponse(responseCode = "400", description = "Invalid request")
     @ApiResponse(responseCode = "409", description = "Item already exists in cart")
-    @PreAuthorize("hasRole('client')")
+    @PreAuthorize("hasAnyRole('client', 'auxiliar')")
     public ResponseEntity<CartResponse> addItem(
             @AuthenticationPrincipal UserDetails userDetails,
             @Valid @RequestBody AddCartItemRequest request) {
@@ -82,7 +82,7 @@ public class CartRestController {
     @Operation(summary = "Update item quantity", description = "Updates the quantity of an item in the cart")
     @ApiResponse(responseCode = "200", description = "Item updated successfully")
     @ApiResponse(responseCode = "404", description = "Item not found in cart")
-    @PreAuthorize("hasRole('client')")
+    @PreAuthorize("hasAnyRole('client', 'auxiliar')")
     public ResponseEntity<CartResponse> updateItemQuantity(
             @AuthenticationPrincipal UserDetails userDetails,
             @Valid @RequestBody UpdateCartItemRequest request) {
@@ -103,7 +103,7 @@ public class CartRestController {
     @Operation(summary = "Remove item", description = "Removes an item from the cart")
     @ApiResponse(responseCode = "200", description = "Item removed successfully")
     @ApiResponse(responseCode = "404", description = "Item not found in cart")
-    @PreAuthorize("hasRole('client')")
+    @PreAuthorize("hasAnyRole('client', 'auxiliar')")
     public ResponseEntity<CartResponse> removeItem(
             @AuthenticationPrincipal UserDetails userDetails,
             @PathVariable Long articleId) {
@@ -119,7 +119,7 @@ public class CartRestController {
     @DeleteMapping
     @Operation(summary = "Clear cart", description = "Removes all items from the cart")
     @ApiResponse(responseCode = "204", description = "Cart cleared successfully")
-    @PreAuthorize("hasRole('client')")
+    @PreAuthorize("hasAnyRole('client', 'auxiliar')")
     public ResponseEntity<Void> clearCart(@AuthenticationPrincipal UserDetails userDetails) {
         logger.info("Clearing cart for user: {}", userDetails.getUsername());
         cartServicePort.clearCart(userDetails.getUsername());
@@ -129,7 +129,7 @@ public class CartRestController {
     @PostMapping("/abandon")
     @Operation(summary = "Abandon cart", description = "Marks the cart as abandoned")
     @ApiResponse(responseCode = "204", description = "Cart abandoned successfully")
-    @PreAuthorize("hasRole('client')")
+    @PreAuthorize("hasAnyRole('client', 'auxiliar')")
     public ResponseEntity<Void> abandonCart(@AuthenticationPrincipal UserDetails userDetails) {
         logger.info("Abandoning cart for user: {}", userDetails.getUsername());
         cartServicePort.abandonCart(userDetails.getUsername());
