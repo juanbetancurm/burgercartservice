@@ -4,6 +4,7 @@ import com.rockburger.cartservice.domain.model.CartUserModel;
 import com.rockburger.cartservice.domain.spi.ICartJwtPersistencePort;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.core.annotation.Order;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
@@ -19,6 +20,7 @@ import java.io.IOException;
 import java.util.List;
 
 @Component
+@Order(1)
 public class JwtCartAuthenticationFilter extends OncePerRequestFilter {
     private static final Logger logger = LoggerFactory.getLogger(JwtCartAuthenticationFilter.class);
 
