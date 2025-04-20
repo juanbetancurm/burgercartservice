@@ -13,6 +13,7 @@ public interface ICartItemRequestMapper {
     @Mapping(target = "id", ignore = true)
     CartItemModel toModel(AddCartItemRequest request);
 
+    @Mapping(target = "subtotal", source = "subtotal")
     CartItemResponse toResponse(CartItemModel model);
 
     List<CartItemResponse> toResponseList(List<CartItemModel> models);

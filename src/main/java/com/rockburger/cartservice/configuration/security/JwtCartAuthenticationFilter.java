@@ -45,7 +45,6 @@ public class JwtCartAuthenticationFilter extends OncePerRequestFilter {
                 CartUserModel user = cartJwtPersistencePort.validateToken(jwt);
 
                 // Normalize role format for Spring Security
-                // This ensures consistent role handling between microservices
                 String role = user.getRole();
                 if (role != null && !role.startsWith("ROLE_")) {
                     role = "ROLE_" + role;
@@ -55,20 +54,29 @@ public class JwtCartAuthenticationFilter extends OncePerRequestFilter {
                         new SimpleGrantedAuthority(role)
                 );
 
+                // Store user details including email as principal
+                String email = user.getEmail();
+                logger.debug("Authenticated user email: {}", email);
+
+                // Store JWT token as credentials and email as principal
                 UsernamePasswordAuthenticationToken authentication =
                         new UsernamePasswordAuthenticationToken(
-                                user.getEmail(),
-                                null,
+                                email, // Use email as principal
+                                jwt,   // Store token as credentials
                                 authorities
                         );
 
                 SecurityContextHolder.getContext().setAuthentication(authentication);
+
+                // Store userId in request attribute for easy access by controllers
+                request.setAttribute("userId", email);
+
                 logger.debug("User authenticated in cart service with role: {}", role);
             } else if (jwt != null) {
                 logger.warn("Invalid JWT token received by cart service");
             }
         } catch (Exception e) {
-            logger.error("Cannot set user authentication in cart service: {}", e.getMessage());
+            logger.error("Cannot set user authentication in cart service: {}", e.getMessage(), e);
         }
 
         filterChain.doFilter(request, response);

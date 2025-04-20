@@ -25,35 +25,42 @@ public class CartJwtAdapter implements ICartJwtPersistencePort {
 
     @Override
     public CartUserModel validateToken(String token) {
-        Claims claims = getClaimsFromToken(token);
-
-        // Extract user details from claims
-        Long userId = null;
         try {
-            // Handle the case where userId might be an Integer or Long
-            Object userIdObj = claims.get("userId");
-            if (userIdObj instanceof Integer) {
-                userId = ((Integer) userIdObj).longValue();
-            } else if (userIdObj instanceof Long) {
-                userId = (Long) userIdObj;
+            Claims claims = getClaimsFromToken(token);
+
+            // Extract user details from claims
+            Long userId = null;
+            try {
+                // Handle the case where userId might be an Integer or Long
+                Object userIdObj = claims.get("userId");
+                if (userIdObj instanceof Integer) {
+                    userId = ((Integer) userIdObj).longValue();
+                } else if (userIdObj instanceof Long) {
+                    userId = (Long) userIdObj;
+                }
+            } catch (Exception e) {
+                logger.warn("Error extracting userId from token: {}", e.getMessage());
             }
+
+            String email = claims.getSubject(); // This is the username/email
+            String role = claims.get("role", String.class);
+
+            // Normalize role format between services
+            if (role != null && !role.startsWith("ROLE_")) {
+                role = "ROLE_" + role;
+            }
+
+            logger.debug("Extracted from token - email: {}, userId: {}, role: {}", email, userId, role);
+
+            return new CartUserModel(
+                    userId,
+                    email, // email/username
+                    role
+            );
         } catch (Exception e) {
-            logger.warn("Error extracting userId from token: {}", e.getMessage());
+            logger.error("Error validating token", e);
+            throw new CartTokensException("Failed to validate token: " + e.getMessage());
         }
-
-        String role = claims.get("role", String.class);
-
-        // Normalize role format between services
-        // The main app might use "client" while cart service expects "ROLE_client"
-        if (role != null && !role.startsWith("ROLE_")) {
-            role = "ROLE_" + role;
-        }
-
-        return new CartUserModel(
-                userId,
-                claims.getSubject(), // email/username
-                role
-        );
     }
 
     @Override
