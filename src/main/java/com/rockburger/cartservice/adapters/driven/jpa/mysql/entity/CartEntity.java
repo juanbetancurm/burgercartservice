@@ -24,7 +24,7 @@ public class CartEntity {
     @Column(name = "user_id", nullable = false)
     private String userId;
 
-    @OneToMany(mappedBy = "cart", cascade = CascadeType.ALL, orphanRemoval = true)
+    @OneToMany(mappedBy = "cart", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.EAGER)
     private List<CartItemEntity> items = new ArrayList<>();
 
     @Column(nullable = false)

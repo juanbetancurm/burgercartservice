@@ -6,7 +6,9 @@ import com.rockburger.cartservice.adapters.driving.http.dto.response.CartRespons
 import com.rockburger.cartservice.adapters.driving.http.mapper.ICartItemRequestMapper;
 import com.rockburger.cartservice.adapters.driving.http.mapper.ICartResponseMapper;
 import com.rockburger.cartservice.domain.api.ICartServicePort;
+import com.rockburger.cartservice.domain.exception.CartNotFoundException;
 import com.rockburger.cartservice.domain.model.CartItemModel;
+import com.rockburger.cartservice.domain.model.CartModel;
 
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
@@ -50,12 +52,18 @@ public class CartRestController {
     @ApiResponse(responseCode = "404", description = "No active cart found")
     @PreAuthorize("hasAnyRole('client', 'auxiliar')")
     public ResponseEntity<CartResponse> getActiveCart(@AuthenticationPrincipal UserDetails userDetails) {
-        logger.info("Retrieving active cart for user: {}", userDetails.getUsername());
-        return ResponseEntity.ok(
-                cartResponseMapper.toResponse(
-                        cartServicePort.getActiveCart(userDetails.getUsername())
-                )
-        );
+        try {
+            logger.info("Retrieving active cart for user: {}", userDetails.getUsername());
+            CartModel cart = cartServicePort.getActiveCart(userDetails.getUsername());
+            return ResponseEntity.ok(cartResponseMapper.toResponse(cart));
+        } catch (CartNotFoundException e) {
+            logger.info("No active cart found for user: {}, creating new cart", userDetails.getUsername());
+            CartModel newCart = cartServicePort.createCart(userDetails.getUsername());
+            return ResponseEntity.ok(cartResponseMapper.toResponse(newCart));
+        } catch (Exception e) {
+            logger.error("Error retrieving active cart", e);
+            throw e;
+        }
     }
 
     @PostMapping("/items")
@@ -69,13 +77,25 @@ public class CartRestController {
             @Valid @RequestBody AddCartItemRequest request) {
         logger.info("Adding item to cart for user: {}", userDetails.getUsername());
 
-        CartItemModel itemModel = cartItemRequestMapper.toModel(request);
-        return new ResponseEntity<>(
-                cartResponseMapper.toResponse(
-                        cartServicePort.addItem(userDetails.getUsername(), itemModel)
-                ),
-                HttpStatus.CREATED
-        );
+        try {
+            // Ensure user has an active cart
+            CartModel cart;
+            try {
+                cart = cartServicePort.getActiveCart(userDetails.getUsername());
+                logger.info("Found existing cart for user: {}", userDetails.getUsername());
+            } catch (CartNotFoundException e) {
+                logger.info("No active cart found for user: {}, creating new cart", userDetails.getUsername());
+                cart = cartServicePort.createCart(userDetails.getUsername());
+            }
+
+            CartItemModel itemModel = cartItemRequestMapper.toModel(request);
+            cart = cartServicePort.addItem(userDetails.getUsername(), itemModel);
+
+            return new ResponseEntity<>(cartResponseMapper.toResponse(cart), HttpStatus.CREATED);
+        } catch (Exception e) {
+            logger.error("Error adding item to cart: {}", e.getMessage(), e);
+            throw e;
+        }
     }
 
     @PutMapping("/items")

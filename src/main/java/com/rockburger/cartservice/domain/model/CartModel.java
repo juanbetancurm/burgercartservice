@@ -21,6 +21,14 @@ public class CartModel {
     private static final String ABANDONED_STATUS = "ABANDONED";
     private static final String COMPLETED_STATUS = "COMPLETED";
 
+    // Default constructor for frameworks
+    public CartModel() {
+        this.items = new ArrayList<>();
+        this.total = 0.0;
+        this.lastUpdated = LocalDateTime.now();
+        this.status = ACTIVE_STATUS;
+    }
+
     public CartModel(String userId) {
         validateUserId(userId);
         this.userId = userId;
@@ -118,6 +126,14 @@ public class CartModel {
     public LocalDateTime getLastUpdated() { return lastUpdated; }
     public String getStatus() { return status; }
 
-    // Setter for id only
+    // Setters
     public void setId(Long id) { this.id = id; }
+    public void setUserId(String userId) { this.userId = userId; }
+    public void setItems(List<CartItemModel> items) {
+        this.items = items != null ? items : new ArrayList<>();
+        updateTotalAndTimestamp();
+    }
+    public void setTotal(double total) { this.total = total; }
+    public void setLastUpdated(LocalDateTime lastUpdated) { this.lastUpdated = lastUpdated; }
+    public void setStatus(String status) { this.status = status; }
 }

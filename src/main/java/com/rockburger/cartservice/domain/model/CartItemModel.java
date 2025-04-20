@@ -11,6 +11,10 @@ public class CartItemModel {
     private double price;
     private double subtotal;
 
+    // Default constructor for frameworks
+    public CartItemModel() {
+    }
+
     public CartItemModel(Long articleId, String articleName, int quantity, double price) {
         validateQuantity(quantity);
         validatePrice(price);
@@ -30,8 +34,8 @@ public class CartItemModel {
     }
 
     private void validatePrice(double price) {
-        if (price <= 0) {
-            throw new InvalidParameterException("Price must be greater than zero");
+        if (price < 0) {
+            throw new InvalidParameterException("Price must be greater than or equal to zero");
         }
         if (Double.isInfinite(price) || Double.isNaN(price)) {
             throw new InvalidParameterException("Invalid price value");
@@ -65,14 +69,21 @@ public class CartItemModel {
     public double getPrice() { return price; }
     public double getSubtotal() { return subtotal; }
 
-    // Setters with validation
+    // Setters
     public void setId(Long id) { this.id = id; }
-
+    public void setArticleId(Long articleId) { this.articleId = articleId; }
+    public void setArticleName(String articleName) { this.articleName = articleName; }
+    public void setQuantity(int quantity) {
+        validateQuantity(quantity);
+        this.quantity = quantity;
+        calculateSubtotal();
+    }
     public void setPrice(double price) {
         validatePrice(price);
         this.price = price;
         calculateSubtotal();
     }
+    public void setSubtotal(double subtotal) { this.subtotal = subtotal; }
 
     @Override
     public boolean equals(Object o) {

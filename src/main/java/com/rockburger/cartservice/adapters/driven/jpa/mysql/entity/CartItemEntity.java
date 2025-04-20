@@ -3,6 +3,7 @@ package com.rockburger.cartservice.adapters.driven.jpa.mysql.entity;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
+import lombok.ToString;
 
 import javax.persistence.*;
 import javax.validation.constraints.Min;
@@ -13,9 +14,7 @@ import javax.validation.constraints.Size;
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
-@Table(name = "cart_items", uniqueConstraints = {
-        @UniqueConstraint(columnNames = {"cart_id", "article_id"})
-})
+@Table(name = "cart_items")
 public class CartItemEntity {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -23,6 +22,7 @@ public class CartItemEntity {
 
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "cart_id", nullable = false)
+    @ToString.Exclude
     private CartEntity cart;
 
     @NotNull
@@ -51,4 +51,11 @@ public class CartItemEntity {
 
     @Version
     private Long version;
+
+    // Pre-persist and pre-update hooks
+    @PrePersist
+    @PreUpdate
+    public void calculateSubtotal() {
+        this.subtotal = this.quantity * this.price;
+    }
 }

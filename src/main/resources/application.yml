@@ -14,6 +14,10 @@ spring:
       hibernate:
         format_sql: true
         dialect: org.hibernate.dialect.MySQL8Dialect
+      defer-datasource-initialization: true  # Allow schema.sql to run after Hibernate
+    sql:
+       init:
+          mode: always  # Always run schema.sql
 
 jwt:
   secret: "9qZgHlZ5Kg+POpcNp1YWlN5F/mkDoYysAaMAzvCydswRhE+tzLXytB/bNiU+NjPiCbKN7UZWFkgtw0wXSDYWQg=="

@@ -3,6 +3,8 @@ package com.rockburger.cartservice.configuration;
 import com.rockburger.cartservice.adapters.driven.jpa.mysql.adapter.CartAdapter;
 import com.rockburger.cartservice.adapters.driven.jpa.mysql.adapter.CartJwtAdapter;
 import com.rockburger.cartservice.adapters.driven.jpa.mysql.mapper.ICartEntityMapper;
+import com.rockburger.cartservice.adapters.driven.jpa.mysql.mapper.ICartItemEntityMapper;
+import com.rockburger.cartservice.adapters.driven.jpa.mysql.repository.ICartItemRepository;
 import com.rockburger.cartservice.adapters.driven.jpa.mysql.repository.ICartRepository;
 import com.rockburger.cartservice.adapters.driving.http.dto.response.CartResponse;
 import com.rockburger.cartservice.adapters.driving.http.mapper.ICartResponseMapper;
@@ -15,10 +17,9 @@ import com.rockburger.cartservice.domain.spi.ICartPersistencePort;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.core.env.Environment;
 
 @Configuration
-@EnableScheduling
 public class BeanConfigurationCart {
     @Value("${jwt.secret}")
     private String jwtSecret;
@@ -27,8 +28,10 @@ public class BeanConfigurationCart {
     @Bean
     public ICartPersistencePort cartPersistencePort(
             ICartRepository cartRepository,
-            ICartEntityMapper cartEntityMapper) {
-        return new CartAdapter(cartRepository, cartEntityMapper);
+            ICartEntityMapper cartEntityMapper,
+            ICartItemRepository cartItemRepository,
+            ICartItemEntityMapper cartItemEntityMapper) {
+        return new CartAdapter(cartRepository, cartEntityMapper, cartItemRepository, cartItemEntityMapper);
     }
 
     // Service beans
