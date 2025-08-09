@@ -10,6 +10,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.Optional;
+
 public class CartUseCase implements ICartServicePort {
     private static final Logger logger = LoggerFactory.getLogger(CartUseCase.class);
     private static final String ACTIVE_STATUS = "ACTIVE";
@@ -27,27 +29,22 @@ public class CartUseCase implements ICartServicePort {
         validateUserId(userId);
         logger.info("Creating new cart for user: {}", userId);
 
-        // Check if user already has an active cart
         try {
-            CartModel existingCart = cartPersistencePort.findByUserIdAndStatus(userId, ACTIVE_STATUS)
-                    .orElse(null);
-
-            if (existingCart != null) {
-                logger.info("User {} already has an active cart with ID {}", userId, existingCart.getId());
-                return existingCart;
+            // Check if user already has an active cart
+            Optional<CartModel> existingCart = cartPersistencePort.findByUserIdAndStatus(userId, ACTIVE_STATUS);
+            if (existingCart.isPresent()) {
+                logger.info("User {} already has an active cart with ID {}", userId, existingCart.get().getId());
+                return existingCart.get();
             }
-        } catch (Exception e) {
-            logger.warn("Error checking for existing cart: {}", e.getMessage());
-        }
 
-        // Create and save new cart
-        CartModel newCart = new CartModel(userId);
-        try {
+            // Create and save new cart
+            CartModel newCart = new CartModel(userId);
             CartModel savedCart = cartPersistencePort.save(newCart);
             logger.info("Created new cart with ID {} for user {}", savedCart.getId(), userId);
             return savedCart;
+
         } catch (Exception e) {
-            logger.error("Error creating new cart: {}", e.getMessage(), e);
+            logger.error("Error creating new cart for user {}: {}", userId, e.getMessage(), e);
             throw new RuntimeException("Failed to create new cart", e);
         }
     }
@@ -77,30 +74,48 @@ public class CartUseCase implements ICartServicePort {
         logger.info("Adding item to cart for user: {} - Article ID: {}, Name: {}, Quantity: {}",
                 userId, item.getArticleId(), item.getArticleName(), item.getQuantity());
 
-        // Get or create cart
-        CartModel cart;
         try {
-            // Try to get existing cart
-            cart = getActiveCart(userId);
-            logger.info("Found existing cart ID {} for user {}", cart.getId(), userId);
-        } catch (CartNotFoundException e) {
-            // Create new cart if not found
-            logger.info("No active cart found for user {}, creating a new one", userId);
-            cart = createCart(userId);
-        }
+            // Get or create cart
+            CartModel cart;
+            try {
+                cart = getActiveCart(userId);
+                logger.debug("Found existing cart ID {} for user {}", cart.getId(), userId);
+            } catch (CartNotFoundException e) {
+                logger.info("No active cart found for user {}, creating a new one", userId);
+                cart = createCart(userId);
+            }
 
-        try {
+            // Check if item already exists in cart
+            boolean itemExists = cart.getItems().stream()
+                    .anyMatch(existingItem -> existingItem.getArticleId().equals(item.getArticleId()));
+
+            if (itemExists) {
+                logger.warn("Item with article ID {} already exists in cart for user {}", item.getArticleId(), userId);
+                throw new DuplicateArticleException("Item already exists in cart. Use update quantity instead.");
+            }
+
             // Add item to cart
             cart.addItem(item);
 
-            // Save and return updated cart
+            // Save and verify the cart
             CartModel updatedCart = cartPersistencePort.save(cart);
+
+            // Additional verification
+            if (updatedCart.getItems().isEmpty()) {
+                logger.error("CRITICAL: Cart appears empty after save operation for user {}. This indicates a persistence issue.", userId);
+                throw new RuntimeException("Failed to persist cart items properly");
+            }
+
             logger.info("Item successfully added to cart for user {}. Cart now has {} items",
                     userId, updatedCart.getItems().size());
 
             return updatedCart;
+
+        } catch (DuplicateArticleException e) {
+            // Re-throw business exceptions as-is
+            throw e;
         } catch (Exception e) {
-            logger.error("Error adding item to cart: {}", e.getMessage(), e);
+            logger.error("Error adding item to cart for user {}: {}", userId, e.getMessage(), e);
             throw new RuntimeException("Failed to add item to cart: " + e.getMessage(), e);
         }
     }
@@ -109,12 +124,20 @@ public class CartUseCase implements ICartServicePort {
     @Transactional
     public CartModel updateItemQuantity(String userId, Long articleId, int quantity) {
         validateUserId(userId);
-        logger.info("Updating item quantity for user: {} and article: {}", userId, articleId);
+        logger.info("Updating item quantity for user: {} and article: {} to quantity: {}", userId, articleId, quantity);
 
-        CartModel cart = getActiveCart(userId);
-        cart.updateItemQuantity(articleId, quantity);
+        try {
+            CartModel cart = getActiveCart(userId);
+            cart.updateItemQuantity(articleId, quantity);
 
-        return cartPersistencePort.save(cart);
+            CartModel updatedCart = cartPersistencePort.save(cart);
+            logger.info("Successfully updated item quantity for user {}", userId);
+            return updatedCart;
+
+        } catch (Exception e) {
+            logger.error("Error updating item quantity for user {}: {}", userId, e.getMessage(), e);
+            throw new RuntimeException("Failed to update item quantity", e);
+        }
     }
 
     @Override
@@ -123,10 +146,18 @@ public class CartUseCase implements ICartServicePort {
         validateUserId(userId);
         logger.info("Removing item from cart for user: {} and article: {}", userId, articleId);
 
-        CartModel cart = getActiveCart(userId);
-        cart.removeItem(articleId);
+        try {
+            CartModel cart = getActiveCart(userId);
+            cart.removeItem(articleId);
 
-        return cartPersistencePort.save(cart);
+            CartModel updatedCart = cartPersistencePort.save(cart);
+            logger.info("Successfully removed item from cart for user {}", userId);
+            return updatedCart;
+
+        } catch (Exception e) {
+            logger.error("Error removing item from cart for user {}: {}", userId, e.getMessage(), e);
+            throw new RuntimeException("Failed to remove item from cart", e);
+        }
     }
 
     @Override
@@ -139,8 +170,12 @@ public class CartUseCase implements ICartServicePort {
             CartModel cart = getActiveCart(userId);
             cart.clear();
             cartPersistencePort.save(cart);
+            logger.info("Successfully cleared cart for user {}", userId);
         } catch (CartNotFoundException e) {
             logger.info("No active cart found for user {}, nothing to clear", userId);
+        } catch (Exception e) {
+            logger.error("Error clearing cart for user {}: {}", userId, e.getMessage(), e);
+            throw new RuntimeException("Failed to clear cart", e);
         }
     }
 
@@ -154,8 +189,12 @@ public class CartUseCase implements ICartServicePort {
             CartModel cart = getActiveCart(userId);
             cart.abandon();
             cartPersistencePort.save(cart);
+            logger.info("Successfully abandoned cart for user {}", userId);
         } catch (CartNotFoundException e) {
             logger.info("No active cart found for user {}, nothing to abandon", userId);
+        } catch (Exception e) {
+            logger.error("Error abandoning cart for user {}: {}", userId, e.getMessage(), e);
+            throw new RuntimeException("Failed to abandon cart", e);
         }
     }
 

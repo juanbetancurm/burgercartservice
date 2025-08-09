@@ -4,11 +4,11 @@ import com.rockburger.cartservice.adapters.driven.jpa.mysql.entity.CartEntity;
 import com.rockburger.cartservice.adapters.driven.jpa.mysql.entity.CartItemEntity;
 import com.rockburger.cartservice.adapters.driven.jpa.mysql.mapper.ICartEntityMapper;
 import com.rockburger.cartservice.adapters.driven.jpa.mysql.mapper.ICartItemEntityMapper;
-import com.rockburger.cartservice.adapters.driven.jpa.mysql.repository.ICartItemRepository;
 import com.rockburger.cartservice.adapters.driven.jpa.mysql.repository.ICartRepository;
-import com.rockburger.cartservice.domain.exception.CartNotFoundException;
+import com.rockburger.cartservice.adapters.driven.jpa.mysql.repository.ICartItemRepository;
 import com.rockburger.cartservice.domain.exception.ConcurrentModificationException;
 import com.rockburger.cartservice.domain.model.CartModel;
+import com.rockburger.cartservice.domain.model.CartItemModel;
 import com.rockburger.cartservice.domain.spi.ICartPersistencePort;
 
 import org.slf4j.Logger;
@@ -18,7 +18,8 @@ import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
 @Service
@@ -30,70 +31,73 @@ public class CartAdapter implements ICartPersistencePort {
     private final ICartEntityMapper cartEntityMapper;
     private final ICartItemEntityMapper cartItemEntityMapper;
 
-    public CartAdapter(
-            ICartRepository cartRepository,
-            ICartEntityMapper cartEntityMapper,
-            ICartItemRepository cartItemRepository,
-            ICartItemEntityMapper cartItemEntityMapper) {
+    public CartAdapter(ICartRepository cartRepository,
+                       ICartItemRepository cartItemRepository,
+                       ICartEntityMapper cartEntityMapper,
+                       ICartItemEntityMapper cartItemEntityMapper) {
         this.cartRepository = cartRepository;
-        this.cartEntityMapper = cartEntityMapper;
         this.cartItemRepository = cartItemRepository;
+        this.cartEntityMapper = cartEntityMapper;
         this.cartItemEntityMapper = cartItemEntityMapper;
     }
 
     @Override
     @Transactional
     public CartModel save(CartModel cartModel) {
+        logger.debug("Saving cart for user: {}", cartModel.getUserId());
+
         try {
-            logger.debug("Saving cart for user: {}", cartModel.getUserId());
-
             CartEntity cartEntity;
-            boolean isNewCart = cartModel.getId() == null;
 
-            if (isNewCart) {
-                // For new carts
-                cartEntity = cartEntityMapper.toEntity(cartModel);
-                cartEntity = cartRepository.save(cartEntity);
+            if (cartModel.getId() != null) {
+                // Update existing cart
+                cartEntity = cartRepository.findById(cartModel.getId())
+                        .orElseThrow(() -> new RuntimeException("Cart not found with ID: " + cartModel.getId()));
+
+                // Clear existing items first to avoid orphan issues
+                cartEntity.getItems().clear();
+                cartRepository.saveAndFlush(cartEntity);
+
+                // Update cart properties
+                cartEntity.setUserId(cartModel.getUserId());
+                cartEntity.setTotal(cartModel.getTotal());
+                cartEntity.setLastUpdated(cartModel.getLastUpdated());
+                cartEntity.setStatus(cartModel.getStatus());
+
             } else {
-                // For existing carts, first retrieve the current entity
-                CartEntity existingCart = cartRepository.findById(cartModel.getId())
-                        .orElseThrow(() -> new CartNotFoundException("Cart not found with ID: " + cartModel.getId()));
-
-                // Clear existing items to avoid duplicates
-                existingCart.getItems().clear();
-
-                // Update fields from model
-                cartEntityMapper.updateEntity(existingCart, cartModel);
-
-                // Save the cart first
-                cartEntity = cartRepository.save(existingCart);
-
-                // Need to flush to ensure the cart is saved before adding items
-                cartRepository.flush();
+                // Create new cart
+                cartEntity = cartEntityMapper.toEntity(cartModel);
+                cartEntity.setItems(new ArrayList<>());
             }
 
-            // Now handle the items separately
-            if (cartModel.getItems() != null && !cartModel.getItems().isEmpty()) {
-                for (var itemModel : cartModel.getItems()) {
-                    CartItemEntity itemEntity = cartItemEntityMapper.toEntity(itemModel);
-                    itemEntity.setCart(cartEntity);
-                    cartItemRepository.save(itemEntity);
-                }
+            // Save cart first to get the ID
+            cartEntity = cartRepository.saveAndFlush(cartEntity);
 
-                // Reload the cart with items
-                cartEntity = cartRepository.findById(cartEntity.getId()).orElseThrow();
+            // Now add items with proper relationship management
+            for (CartItemModel itemModel : cartModel.getItems()) {
+                CartItemEntity itemEntity = cartItemEntityMapper.toEntity(itemModel);
+                itemEntity.setCart(cartEntity);
+                itemEntity.calculateSubtotal(); // Ensure subtotal is calculated
+                cartEntity.addItem(itemEntity);
             }
 
-            return cartEntityMapper.toModel(cartEntity);
+            // Final save with items
+            CartEntity savedEntity = cartRepository.saveAndFlush(cartEntity);
+
+            CartModel savedModel = cartEntityMapper.toModel(savedEntity);
+            logger.info("Successfully saved cart ID {} for user {} with {} items",
+                    savedEntity.getId(), savedModel.getUserId(), savedModel.getItems().size());
+
+            return savedModel;
 
         } catch (ObjectOptimisticLockingFailureException e) {
-            logger.error("Concurrent modification detected when saving cart", e);
-            throw new ConcurrentModificationException("Cart was modified concurrently");
+            logger.error("Optimistic locking failure when saving cart for user {}: {}", cartModel.getUserId(), e.getMessage());
+            throw new ConcurrentModificationException("Cart was modified by another transaction", e);
         } catch (DataIntegrityViolationException e) {
-            logger.error("Data integrity violation when saving cart", e);
-            throw new RuntimeException("Failed to save cart due to data integrity violation", e);
+            logger.error("Data integrity violation when saving cart for user {}: {}", cartModel.getUserId(), e.getMessage());
+            throw new RuntimeException("Data integrity violation when saving cart", e);
         } catch (Exception e) {
-            logger.error("Error saving cart: {}", e.getMessage(), e);
+            logger.error("Error saving cart for user {}: {}", cartModel.getUserId(), e.getMessage(), e);
             throw new RuntimeException("Failed to save cart", e);
         }
     }
@@ -102,21 +106,43 @@ public class CartAdapter implements ICartPersistencePort {
     @Transactional(readOnly = true)
     public Optional<CartModel> findByUserIdAndStatus(String userId, String status) {
         logger.debug("Finding cart for user: {} with status: {}", userId, status);
-        return cartRepository.findByUserIdAndStatus(userId, status)
-                .map(cartEntityMapper::toModel);
+
+        List<CartEntity> carts = cartRepository.findByUserIdAndStatus(userId, status);
+        if (carts.isEmpty()) {
+            return Optional.empty();
+        }
+
+        // Return the most recent cart (assuming the list is ordered or take the first one)
+        CartEntity cartEntity = carts.get(0);
+        return Optional.of(cartEntityMapper.toModel(cartEntity));
     }
 
     @Override
     @Transactional
     public void deleteByUserId(String userId) {
         logger.debug("Deleting cart for user: {}", userId);
-        cartRepository.findByUserIdAndStatus(userId, "ACTIVE")
-                .ifPresent(cartRepository::delete);
+
+        try {
+            // Find and delete active carts for the user
+            List<CartEntity> carts = cartRepository.findByUserIdAndStatus(userId, "ACTIVE");
+            if (!carts.isEmpty()) {
+                for (CartEntity cart : carts) {
+                    cartRepository.delete(cart);
+                }
+                logger.info("Successfully deleted {} cart(s) for user: {}", carts.size(), userId);
+            } else {
+                logger.info("No active cart found to delete for user: {}", userId);
+            }
+        } catch (Exception e) {
+            logger.error("Error deleting cart for user {}: {}", userId, e.getMessage(), e);
+            throw new RuntimeException("Failed to delete cart", e);
+        }
     }
 
     @Override
     @Transactional(readOnly = true)
     public boolean existsByUserIdAndStatus(String userId, String status) {
+        logger.debug("Checking if cart exists for user: {} with status: {}", userId, status);
         return cartRepository.existsByUserIdAndStatus(userId, status);
     }
 
@@ -124,9 +150,27 @@ public class CartAdapter implements ICartPersistencePort {
     @Transactional
     public void updateCartStatus(String userId, String oldStatus, String newStatus) {
         logger.debug("Updating cart status for user: {} from {} to {}", userId, oldStatus, newStatus);
-        int updatedCount = cartRepository.updateCartStatus(userId, oldStatus, newStatus);
-        if (updatedCount == 0) {
-            logger.warn("No cart found to update status for user: {}", userId);
+
+        try {
+            // Since the repository doesn't have updateCartStatus method, implement it manually
+            List<CartEntity> carts = cartRepository.findByUserIdAndStatus(userId, oldStatus);
+            int updatedCount = 0;
+
+            for (CartEntity cart : carts) {
+                cart.setStatus(newStatus);
+                cartRepository.save(cart);
+                updatedCount++;
+            }
+
+            if (updatedCount == 0) {
+                logger.warn("No cart found to update status for user: {} with status: {}", userId, oldStatus);
+            } else {
+                logger.info("Successfully updated {} cart(s) status for user: {} from {} to {}",
+                        updatedCount, userId, oldStatus, newStatus);
+            }
+        } catch (Exception e) {
+            logger.error("Error updating cart status for user {}: {}", userId, e.getMessage(), e);
+            throw new RuntimeException("Failed to update cart status", e);
         }
     }
 
@@ -134,7 +178,25 @@ public class CartAdapter implements ICartPersistencePort {
     @Transactional
     public void deleteExpiredCarts(int expirationHours) {
         logger.info("Deleting expired carts older than {} hours", expirationHours);
-        LocalDateTime expirationTime = LocalDateTime.now().minusHours(expirationHours);
-        cartRepository.deleteExpiredCarts(expirationTime);
+
+        try {
+            // Since the repository doesn't have deleteExpiredCarts method, implement it manually
+            // This is a simple implementation - you might want to add a custom query for better performance
+            List<CartEntity> allCarts = cartRepository.findAll();
+            java.time.LocalDateTime expirationTime = java.time.LocalDateTime.now().minusHours(expirationHours);
+
+            int deletedCount = 0;
+            for (CartEntity cart : allCarts) {
+                if (cart.getLastUpdated().isBefore(expirationTime) && "ACTIVE".equals(cart.getStatus())) {
+                    cartRepository.delete(cart);
+                    deletedCount++;
+                }
+            }
+
+            logger.info("Successfully deleted {} expired carts older than {}", deletedCount, expirationTime);
+        } catch (Exception e) {
+            logger.error("Error deleting expired carts: {}", e.getMessage(), e);
+            throw new RuntimeException("Failed to delete expired carts", e);
+        }
     }
 }

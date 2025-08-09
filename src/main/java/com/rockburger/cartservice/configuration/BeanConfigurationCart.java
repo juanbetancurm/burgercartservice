@@ -32,10 +32,10 @@ public class BeanConfigurationCart {
     @Bean
     public ICartPersistencePort cartPersistencePort(
             ICartRepository cartRepository,
-            ICartEntityMapper cartEntityMapper,
             ICartItemRepository cartItemRepository,
+            ICartEntityMapper cartEntityMapper,
             ICartItemEntityMapper cartItemEntityMapper) {
-        return new CartAdapter(cartRepository, cartEntityMapper, cartItemRepository, cartItemEntityMapper);
+        return new CartAdapter(cartRepository, cartItemRepository, cartEntityMapper, cartItemEntityMapper);
     }
 
     // Service beans

@@ -7,6 +7,7 @@ import com.rockburger.cartservice.adapters.driving.http.mapper.ICartItemRequestM
 import com.rockburger.cartservice.adapters.driving.http.mapper.ICartResponseMapper;
 import com.rockburger.cartservice.domain.api.ICartServicePort;
 import com.rockburger.cartservice.domain.exception.CartNotFoundException;
+import com.rockburger.cartservice.domain.exception.DuplicateArticleException;
 import com.rockburger.cartservice.domain.model.CartItemModel;
 import com.rockburger.cartservice.domain.model.CartModel;
 
@@ -21,7 +22,6 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
-import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.*;
 
@@ -48,7 +48,6 @@ public class CartRestController {
         this.cartResponseMapper = cartResponseMapper;
     }
 
-    // Utility method to get the current user's ID (email)
     private String getCurrentUserId(HttpServletRequest request) {
         // First try to get from request attribute (set by filter)
         String userId = (String) request.getAttribute("userId");
@@ -82,14 +81,17 @@ public class CartRestController {
 
         try {
             CartModel cart = cartServicePort.getActiveCart(userId);
-            return ResponseEntity.ok(cartResponseMapper.toResponse(cart));
+            CartResponse response = cartResponseMapper.toResponse(cart);
+            logger.debug("Successfully retrieved cart with {} items for user {}",
+                    response.getItems() != null ? response.getItems().size() : 0, userId);
+            return ResponseEntity.ok(response);
         } catch (CartNotFoundException e) {
             logger.info("No active cart found for user: {}, creating new cart", userId);
             CartModel newCart = cartServicePort.createCart(userId);
             return ResponseEntity.ok(cartResponseMapper.toResponse(newCart));
         } catch (Exception e) {
-            logger.error("Error retrieving active cart: {}", e.getMessage(), e);
-            throw e;
+            logger.error("Error retrieving active cart for user {}: {}", userId, e.getMessage(), e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
         }
     }
 
@@ -106,23 +108,21 @@ public class CartRestController {
         logger.info("Adding item to cart for user: {}, item: {}", userId, itemRequest);
 
         try {
-            // Ensure user has an active cart
-            CartModel cart;
-            try {
-                cart = cartServicePort.getActiveCart(userId);
-                logger.info("Found existing cart for user: {}", userId);
-            } catch (CartNotFoundException e) {
-                logger.info("No active cart found for user: {}, creating new cart", userId);
-                cart = cartServicePort.createCart(userId);
-            }
-
             CartItemModel itemModel = cartItemRequestMapper.toModel(itemRequest);
-            cart = cartServicePort.addItem(userId, itemModel);
+            CartModel updatedCart = cartServicePort.addItem(userId, itemModel);
+            CartResponse response = cartResponseMapper.toResponse(updatedCart);
 
-            return new ResponseEntity<>(cartResponseMapper.toResponse(cart), HttpStatus.CREATED);
+            logger.info("Successfully added item to cart for user {}. Cart now has {} items",
+                    userId, response.getItems() != null ? response.getItems().size() : 0);
+
+            return new ResponseEntity<>(response, HttpStatus.CREATED);
+
+        } catch (DuplicateArticleException e) {
+            logger.warn("Duplicate item addition attempt for user {}: {}", userId, e.getMessage());
+            return ResponseEntity.status(HttpStatus.CONFLICT).build();
         } catch (Exception e) {
-            logger.error("Error adding item to cart: {}", e.getMessage(), e);
-            throw e;
+            logger.error("Error adding item to cart for user {}: {}", userId, e.getMessage(), e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
         }
     }
 
@@ -137,15 +137,17 @@ public class CartRestController {
         String userId = getCurrentUserId(request);
         logger.info("Updating item quantity for user: {}, article: {}", userId, updateRequest.getArticleId());
 
-        return ResponseEntity.ok(
-                cartResponseMapper.toResponse(
-                        cartServicePort.updateItemQuantity(
-                                userId,
-                                updateRequest.getArticleId(),
-                                updateRequest.getQuantity()
-                        )
-                )
-        );
+        try {
+            CartModel updatedCart = cartServicePort.updateItemQuantity(
+                    userId,
+                    updateRequest.getArticleId(),
+                    updateRequest.getQuantity()
+            );
+            return ResponseEntity.ok(cartResponseMapper.toResponse(updatedCart));
+        } catch (Exception e) {
+            logger.error("Error updating item quantity for user {}: {}", userId, e.getMessage(), e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
     }
 
     @DeleteMapping("/items/{articleId}")
@@ -159,11 +161,13 @@ public class CartRestController {
         String userId = getCurrentUserId(request);
         logger.info("Removing item from cart for user: {}, article: {}", userId, articleId);
 
-        return ResponseEntity.ok(
-                cartResponseMapper.toResponse(
-                        cartServicePort.removeItem(userId, articleId)
-                )
-        );
+        try {
+            CartModel updatedCart = cartServicePort.removeItem(userId, articleId);
+            return ResponseEntity.ok(cartResponseMapper.toResponse(updatedCart));
+        } catch (Exception e) {
+            logger.error("Error removing item from cart for user {}: {}", userId, e.getMessage(), e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
     }
 
     @DeleteMapping
@@ -173,8 +177,14 @@ public class CartRestController {
     public ResponseEntity<Void> clearCart(HttpServletRequest request) {
         String userId = getCurrentUserId(request);
         logger.info("Clearing cart for user: {}", userId);
-        cartServicePort.clearCart(userId);
-        return ResponseEntity.noContent().build();
+
+        try {
+            cartServicePort.clearCart(userId);
+            return ResponseEntity.noContent().build();
+        } catch (Exception e) {
+            logger.error("Error clearing cart for user {}: {}", userId, e.getMessage(), e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
     }
 
     @PostMapping("/abandon")
@@ -184,7 +194,13 @@ public class CartRestController {
     public ResponseEntity<Void> abandonCart(HttpServletRequest request) {
         String userId = getCurrentUserId(request);
         logger.info("Abandoning cart for user: {}", userId);
-        cartServicePort.abandonCart(userId);
-        return ResponseEntity.noContent().build();
+
+        try {
+            cartServicePort.abandonCart(userId);
+            return ResponseEntity.noContent().build();
+        } catch (Exception e) {
+            logger.error("Error abandoning cart for user {}: {}", userId, e.getMessage(), e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
     }
 }

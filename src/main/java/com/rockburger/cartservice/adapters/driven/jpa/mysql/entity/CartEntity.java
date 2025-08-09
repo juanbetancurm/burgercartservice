@@ -39,14 +39,84 @@ public class CartEntity {
     @Version
     private Long version;
 
-    // Helper method to manage bidirectional relationship
+    // Custom constructor for proper initialization
+    public CartEntity(String userId, String status) {
+        this.userId = userId;
+        this.status = status;
+        this.items = new ArrayList<>();
+        this.total = 0.0;
+        this.lastUpdated = LocalDateTime.now();
+    }
+
+    // Helper methods to manage bidirectional relationship properly
     public void addItem(CartItemEntity item) {
+        if (item == null) {
+            return;
+        }
+
+        // Remove if already exists (based on articleId)
+        items.removeIf(existingItem -> existingItem.getArticleId().equals(item.getArticleId()));
+
+        // Add new item
         items.add(item);
         item.setCart(this);
+
+        // Recalculate total
+        recalculateTotal();
     }
 
     public void removeItem(CartItemEntity item) {
+        if (item == null) {
+            return;
+        }
+
         items.remove(item);
         item.setCart(null);
+        recalculateTotal();
+    }
+
+    public void removeItemByArticleId(Long articleId) {
+        items.removeIf(item -> item.getArticleId().equals(articleId));
+        recalculateTotal();
+    }
+
+    public void clearItems() {
+        for (CartItemEntity item : items) {
+            item.setCart(null);
+        }
+        items.clear();
+        this.total = 0.0;
+        this.lastUpdated = LocalDateTime.now();
+    }
+
+    private void recalculateTotal() {
+        this.total = items.stream()
+                .mapToDouble(CartItemEntity::getSubtotal)
+                .sum();
+        this.lastUpdated = LocalDateTime.now();
+    }
+
+    // Override setItems to ensure proper relationship management
+    public void setItems(List<CartItemEntity> items) {
+        if (this.items == null) {
+            this.items = new ArrayList<>();
+        }
+
+        // Clear existing items
+        this.items.clear();
+
+        // Add new items with proper relationship setup
+        if (items != null) {
+            for (CartItemEntity item : items) {
+                addItem(item);
+            }
+        }
+    }
+
+    @PrePersist
+    @PreUpdate
+    public void updateTimestamp() {
+        this.lastUpdated = LocalDateTime.now();
+        recalculateTotal();
     }
 }
