@@ -23,6 +23,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.web.bind.annotation.*;
 
 import javax.servlet.http.HttpServletRequest;
@@ -51,23 +52,39 @@ public class CartRestController {
     private String getCurrentUserId(HttpServletRequest request) {
         // First try to get from request attribute (set by filter)
         String userId = (String) request.getAttribute("userId");
+        logger.debug("User ID from request attribute: {}", userId);
 
         // If not found, try to get from security context
-        if (userId == null || userId.isEmpty()) {
+        if (userId == null || userId.trim().isEmpty()) {
             Authentication auth = SecurityContextHolder.getContext().getAuthentication();
-            if (auth != null && auth.getPrincipal() != null) {
-                userId = auth.getPrincipal().toString();
+            if (auth != null) {
+                logger.debug("Authentication principal type: {}, principal: {}",
+                        auth.getPrincipal() != null ? auth.getPrincipal().getClass().getSimpleName() : "null",
+                        auth.getPrincipal());
+
+                // Handle different principal types
+                if (auth.getPrincipal() instanceof UserDetails) {
+                    UserDetails userDetails = (UserDetails) auth.getPrincipal();
+                    userId = userDetails.getUsername();
+                    logger.debug("User ID from UserDetails: {}", userId);
+                } else if (auth.getPrincipal() instanceof String) {
+                    userId = (String) auth.getPrincipal();
+                    logger.debug("User ID from String principal: {}", userId);
+                } else if (auth.getName() != null && !auth.getName().equals("anonymousUser")) {
+                    userId = auth.getName();
+                    logger.debug("User ID from auth name: {}", userId);
+                }
             }
         }
 
-        logger.debug("Current user ID: {}", userId);
+        logger.debug("Final resolved user ID: {}", userId);
 
-        if (userId == null || userId.isEmpty()) {
+        if (userId == null || userId.trim().isEmpty() || "anonymousUser".equals(userId)) {
             logger.error("Could not determine user ID from request or security context");
-            throw new IllegalStateException("User not authenticated");
+            throw new IllegalStateException("User not authenticated properly");
         }
 
-        return userId;
+        return userId.trim();
     }
 
     @GetMapping
@@ -135,7 +152,8 @@ public class CartRestController {
             HttpServletRequest request,
             @Valid @RequestBody UpdateCartItemRequest updateRequest) {
         String userId = getCurrentUserId(request);
-        logger.info("Updating item quantity for user: {}, article: {}", userId, updateRequest.getArticleId());
+        logger.info("Updating item quantity for user: {}, article: {}, quantity: {}",
+                userId, updateRequest.getArticleId(), updateRequest.getQuantity());
 
         try {
             CartModel updatedCart = cartServicePort.updateItemQuantity(
@@ -143,7 +161,9 @@ public class CartRestController {
                     updateRequest.getArticleId(),
                     updateRequest.getQuantity()
             );
-            return ResponseEntity.ok(cartResponseMapper.toResponse(updatedCart));
+            CartResponse response = cartResponseMapper.toResponse(updatedCart);
+            logger.info("Successfully updated item quantity for user: {}", userId);
+            return ResponseEntity.ok(response);
         } catch (Exception e) {
             logger.error("Error updating item quantity for user {}: {}", userId, e.getMessage(), e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
@@ -163,7 +183,12 @@ public class CartRestController {
 
         try {
             CartModel updatedCart = cartServicePort.removeItem(userId, articleId);
-            return ResponseEntity.ok(cartResponseMapper.toResponse(updatedCart));
+            CartResponse response = cartResponseMapper.toResponse(updatedCart);
+            logger.info("Successfully removed item from cart for user: {}", userId);
+            return ResponseEntity.ok(response);
+        } catch (CartNotFoundException e) {
+            logger.warn("Cart or item not found for user {}, article {}: {}", userId, articleId, e.getMessage());
+            return ResponseEntity.notFound().build();
         } catch (Exception e) {
             logger.error("Error removing item from cart for user {}: {}", userId, e.getMessage(), e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
@@ -180,6 +205,7 @@ public class CartRestController {
 
         try {
             cartServicePort.clearCart(userId);
+            logger.info("Successfully cleared cart for user: {}", userId);
             return ResponseEntity.noContent().build();
         } catch (Exception e) {
             logger.error("Error clearing cart for user {}: {}", userId, e.getMessage(), e);
@@ -197,6 +223,7 @@ public class CartRestController {
 
         try {
             cartServicePort.abandonCart(userId);
+            logger.info("Successfully abandoned cart for user: {}", userId);
             return ResponseEntity.noContent().build();
         } catch (Exception e) {
             logger.error("Error abandoning cart for user {}: {}", userId, e.getMessage(), e);
