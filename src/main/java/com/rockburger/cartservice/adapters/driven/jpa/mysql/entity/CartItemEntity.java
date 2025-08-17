@@ -56,25 +56,52 @@ public class CartItemEntity {
     @Column(name = "updated_at", nullable = false)
     private LocalDateTime updatedAt;
 
-    // Add these methods:
-    @PrePersist
-    public void onCreate() {
-        this.createdAt = LocalDateTime.now();
-        this.updatedAt = LocalDateTime.now();
-    }
-
-    @PreUpdate
-    public void onUpdate() {
-        this.updatedAt = LocalDateTime.now();
-    }
-
     @Version
     private Long version;
 
-    // Pre-persist and pre-update hooks
+    /**
+     * JPA lifecycle callback for entity creation.
+     * Sets creation and update timestamps, and calculates subtotal.
+     */
     @PrePersist
+    public void onCreate() {
+        LocalDateTime now = LocalDateTime.now();
+        this.createdAt = now;
+        this.updatedAt = now;
+        this.subtotal = this.quantity * this.price;
+    }
+
+    /**
+     * JPA lifecycle callback for entity updates.
+     * Updates the timestamp and recalculates subtotal.
+     */
     @PreUpdate
+    public void onUpdate() {
+        this.updatedAt = LocalDateTime.now();
+        this.subtotal = this.quantity * this.price;
+    }
+
+    /**
+     * Manual method to recalculate subtotal when needed.
+     * This is not a JPA callback to avoid conflicts.
+     */
     public void calculateSubtotal() {
+        this.subtotal = this.quantity * this.price;
+    }
+
+    /**
+     * Setter for quantity that automatically recalculates subtotal.
+     */
+    public void setQuantity(int quantity) {
+        this.quantity = quantity;
+        this.subtotal = this.quantity * this.price;
+    }
+
+    /**
+     * Setter for price that automatically recalculates subtotal.
+     */
+    public void setPrice(double price) {
+        this.price = price;
         this.subtotal = this.quantity * this.price;
     }
 }
