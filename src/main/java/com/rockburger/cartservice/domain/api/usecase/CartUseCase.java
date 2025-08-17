@@ -10,12 +10,18 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDateTime;
 import java.util.Optional;
 
 public class CartUseCase implements ICartServicePort {
     private static final Logger logger = LoggerFactory.getLogger(CartUseCase.class);
     private static final String ACTIVE_STATUS = "ACTIVE";
     private static final String ABANDONED_STATUS = "ABANDONED";
+    private static final String COMPLETED_STATUS = "COMPLETED";
+
+    // Cart session management constants
+    private static final int CART_EXPIRY_HOURS = 24; // Cart expires after 24 hours
+    private static final int CART_WARNING_HOURS = 4; // Warn when cart will expire in 4 hours
 
     private final ICartPersistencePort cartPersistencePort;
 
@@ -30,11 +36,23 @@ public class CartUseCase implements ICartServicePort {
         logger.info("Creating new cart for user: {}", userId);
 
         try {
-            // Check if user already has an active cart
+            // First, abandon any existing active carts that might be stale
+            abandonStaleCartsForUser(userId);
+
+            // Check if user already has an active cart after cleanup
             Optional<CartModel> existingCart = cartPersistencePort.findByUserIdAndStatus(userId, ACTIVE_STATUS);
             if (existingCart.isPresent()) {
-                logger.info("User {} already has an active cart with ID {}", userId, existingCart.get().getId());
-                return existingCart.get();
+                CartModel cart = existingCart.get();
+
+                // Check if the existing cart is stale
+                if (isCartStale(cart)) {
+                    logger.info("Found stale cart for user {}, abandoning it", userId);
+                    cart.abandon();
+                    cartPersistencePort.save(cart);
+                } else {
+                    logger.info("User {} already has an active cart with ID {}", userId, cart.getId());
+                    return cart;
+                }
             }
 
             // Create and save new cart
@@ -55,11 +73,30 @@ public class CartUseCase implements ICartServicePort {
         validateUserId(userId);
         logger.debug("Retrieving active cart for user: {}", userId);
 
-        return cartPersistencePort.findByUserIdAndStatus(userId, ACTIVE_STATUS)
-                .orElseThrow(() -> {
-                    logger.warn("No active cart found for user: {}", userId);
-                    return new CartNotFoundException("No active cart found for user");
-                });
+        Optional<CartModel> cartOptional = cartPersistencePort.findByUserIdAndStatus(userId, ACTIVE_STATUS);
+
+        if (cartOptional.isEmpty()) {
+            logger.warn("No active cart found for user: {}", userId);
+            throw new CartNotFoundException("No active cart found for user");
+        }
+
+        CartModel cart = cartOptional.get();
+
+        // Check if cart is stale
+        if (isCartStale(cart)) {
+            logger.warn("Found stale cart for user {}, abandoning it", userId);
+            cart.abandon();
+            cartPersistencePort.save(cart);
+            throw new CartNotFoundException("Cart has expired, please create a new cart");
+        }
+
+        // Log warning if cart is approaching expiry
+        if (isCartApproachingExpiry(cart)) {
+            logger.info("Cart for user {} is approaching expiry (last updated: {})",
+                    userId, cart.getLastUpdated());
+        }
+
+        return cart;
     }
 
     @Override
@@ -75,15 +112,18 @@ public class CartUseCase implements ICartServicePort {
                 userId, item.getArticleId(), item.getArticleName(), item.getQuantity());
 
         try {
-            // Get or create cart
+            // Get or create cart with session validation
             CartModel cart;
             try {
-                cart = getActiveCart(userId);
+                cart = getActiveCartWithSessionValidation(userId);
                 logger.debug("Found existing cart ID {} for user {}", cart.getId(), userId);
             } catch (CartNotFoundException e) {
                 logger.info("No active cart found for user {}, creating a new one", userId);
                 cart = createCart(userId);
             }
+
+            // Validate cart state before adding item
+            validateCartForOperation(cart, userId);
 
             // Check if item already exists in cart
             boolean itemExists = cart.getItems().stream()
@@ -127,13 +167,18 @@ public class CartUseCase implements ICartServicePort {
         logger.info("Updating item quantity for user: {} and article: {} to quantity: {}", userId, articleId, quantity);
 
         try {
-            CartModel cart = getActiveCart(userId);
+            CartModel cart = getActiveCartWithSessionValidation(userId);
+            validateCartForOperation(cart, userId);
+
             cart.updateItemQuantity(articleId, quantity);
 
             CartModel updatedCart = cartPersistencePort.save(cart);
             logger.info("Successfully updated item quantity for user {}", userId);
             return updatedCart;
 
+        } catch (CartNotFoundException | CartItemNotFoundException e) {
+            // Re-throw these specific exceptions
+            throw e;
         } catch (Exception e) {
             logger.error("Error updating item quantity for user {}: {}", userId, e.getMessage(), e);
             throw new RuntimeException("Failed to update item quantity", e);
@@ -147,13 +192,27 @@ public class CartUseCase implements ICartServicePort {
         logger.info("Removing item from cart for user: {} and article: {}", userId, articleId);
 
         try {
-            CartModel cart = getActiveCart(userId);
+            CartModel cart = getActiveCartWithSessionValidation(userId);
+            validateCartForOperation(cart, userId);
+
+            // Check if item exists before attempting removal
+            boolean itemExists = cart.getItems().stream()
+                    .anyMatch(item -> item.getArticleId().equals(articleId));
+
+            if (!itemExists) {
+                logger.warn("Attempt to remove non-existent item {} from cart for user {}", articleId, userId);
+                throw new CartItemNotFoundException("Article not found in cart");
+            }
+
             cart.removeItem(articleId);
 
             CartModel updatedCart = cartPersistencePort.save(cart);
             logger.info("Successfully removed item from cart for user {}", userId);
             return updatedCart;
 
+        } catch (CartNotFoundException | CartItemNotFoundException | InvalidCartOperationException e) {
+            // Re-throw these specific exceptions with proper context
+            throw e;
         } catch (Exception e) {
             logger.error("Error removing item from cart for user {}: {}", userId, e.getMessage(), e);
             throw new RuntimeException("Failed to remove item from cart", e);
@@ -167,7 +226,7 @@ public class CartUseCase implements ICartServicePort {
         logger.info("Clearing cart for user: {}", userId);
 
         try {
-            CartModel cart = getActiveCart(userId);
+            CartModel cart = getActiveCartWithSessionValidation(userId);
             cart.clear();
             cartPersistencePort.save(cart);
             logger.info("Successfully cleared cart for user {}", userId);
@@ -186,7 +245,7 @@ public class CartUseCase implements ICartServicePort {
         logger.info("Abandoning cart for user: {}", userId);
 
         try {
-            CartModel cart = getActiveCart(userId);
+            CartModel cart = getActiveCartWithSessionValidation(userId);
             cart.abandon();
             cartPersistencePort.save(cart);
             logger.info("Successfully abandoned cart for user {}", userId);
@@ -207,6 +266,117 @@ public class CartUseCase implements ICartServicePort {
         return cartPersistencePort.findByUserIdAndStatus(userId, status)
                 .orElseThrow(() -> new CartNotFoundException(
                         String.format("No cart found for user with status: %s", status)));
+    }
+
+    /**
+     * Get active cart with enhanced session validation
+     */
+    private CartModel getActiveCartWithSessionValidation(String userId) {
+        Optional<CartModel> cartOptional = cartPersistencePort.findByUserIdAndStatus(userId, ACTIVE_STATUS);
+
+        if (cartOptional.isEmpty()) {
+            throw new CartNotFoundException("No active cart found for user");
+        }
+
+        CartModel cart = cartOptional.get();
+
+        // Enhanced session validation
+        if (isCartStale(cart)) {
+            logger.warn("Cart for user {} is stale (last updated: {}), abandoning it",
+                    userId, cart.getLastUpdated());
+            cart.abandon();
+            cartPersistencePort.save(cart);
+            throw new CartNotFoundException("Cart session has expired, please create a new cart");
+        }
+
+        return cart;
+    }
+
+    /**
+     * Validate cart state before performing operations
+     */
+    private void validateCartForOperation(CartModel cart, String userId) {
+        if (cart == null) {
+            throw new CartNotFoundException("Cart not found");
+        }
+
+        if (!ACTIVE_STATUS.equals(cart.getStatus())) {
+            logger.warn("Attempt to operate on non-active cart for user {}, status: {}", userId, cart.getStatus());
+            throw new InvalidCartOperationException("Cart is not active");
+        }
+
+        if (isCartStale(cart)) {
+            logger.warn("Attempt to operate on stale cart for user {}", userId);
+            throw new InvalidCartOperationException("Cart session has expired");
+        }
+    }
+
+    /**
+     * Check if a cart is stale (older than expiry time)
+     */
+    private boolean isCartStale(CartModel cart) {
+        if (cart.getLastUpdated() == null) {
+            return true;
+        }
+
+        LocalDateTime expiryTime = cart.getLastUpdated().plusHours(CART_EXPIRY_HOURS);
+        return LocalDateTime.now().isAfter(expiryTime);
+    }
+
+    /**
+     * Check if a cart is approaching expiry
+     */
+    private boolean isCartApproachingExpiry(CartModel cart) {
+        if (cart.getLastUpdated() == null) {
+            return true;
+        }
+
+        LocalDateTime warningTime = cart.getLastUpdated().plusHours(CART_EXPIRY_HOURS - CART_WARNING_HOURS);
+        return LocalDateTime.now().isAfter(warningTime);
+    }
+
+    /**
+     * Abandon stale carts for a user
+     */
+    @Transactional
+    public void abandonStaleCartsForUser(String userId) {
+        try {
+            Optional<CartModel> activeCartOpt = cartPersistencePort.findByUserIdAndStatus(userId, ACTIVE_STATUS);
+
+            if (activeCartOpt.isPresent()) {
+                CartModel activeCart = activeCartOpt.get();
+
+                if (isCartStale(activeCart)) {
+                    logger.info("Abandoning stale cart for user {}", userId);
+                    activeCart.abandon();
+                    cartPersistencePort.save(activeCart);
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("Error abandoning stale carts for user {}: {}", userId, e.getMessage());
+        }
+    }
+
+    /**
+     * Cleanup expired carts (can be called by scheduled task)
+     */
+    @Transactional
+    public int cleanupExpiredCarts() {
+        logger.info("Starting cleanup of expired carts");
+
+        try {
+            LocalDateTime cutoffTime = LocalDateTime.now().minusHours(CART_EXPIRY_HOURS);
+
+            // This would require additional repository method
+            // For now, we'll log the intent
+            logger.info("Would cleanup carts older than {}", cutoffTime);
+
+            // TODO: Implement batch cleanup in repository
+            return 0;
+        } catch (Exception e) {
+            logger.error("Error during cart cleanup: {}", e.getMessage(), e);
+            return 0;
+        }
     }
 
     private void validateUserId(String userId) {

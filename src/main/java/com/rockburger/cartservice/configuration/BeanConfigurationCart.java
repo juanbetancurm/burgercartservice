@@ -28,14 +28,12 @@ public class BeanConfigurationCart {
     @Value("${jwt.secret}")
     private String jwtSecret;
 
-    // Persistence beans
+    // Persistence beans - UPDATED: Only 2 parameters now
     @Bean
     public ICartPersistencePort cartPersistencePort(
             ICartRepository cartRepository,
-            ICartItemRepository cartItemRepository,
-            ICartEntityMapper cartEntityMapper,
-            ICartItemEntityMapper cartItemEntityMapper) {
-        return new CartAdapter(cartRepository, cartItemRepository, cartEntityMapper, cartItemEntityMapper);
+            ICartEntityMapper cartEntityMapper) {
+        return new CartAdapter(cartRepository, cartEntityMapper);
     }
 
     // Service beans

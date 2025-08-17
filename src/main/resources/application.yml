@@ -36,3 +36,18 @@ management:
   endpoint:
     health:
       show-details: always
+
+cart:
+  session:
+    expiry:
+      hours: 24
+    warning:
+      hours: 4
+    management:
+      enabled: true
+  cleanup:
+    enabled: true
+    batch:
+      size: 100
+  metrics:
+    enabled: true

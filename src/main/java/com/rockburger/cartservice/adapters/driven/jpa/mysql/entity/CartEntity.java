@@ -30,14 +30,25 @@ public class CartEntity {
     @Column(nullable = false)
     private double total;
 
+    // ADD THESE NEW FIELDS FROM MIGRATION
+    @Column(name = "created_at", nullable = false)
+    private LocalDateTime createdAt;
+
     @Column(name = "last_updated", nullable = false)
     private LocalDateTime lastUpdated;
 
     @Column(nullable = false, length = 20)
     private String status;
 
+    @Column(name = "session_id", nullable = false, length = 32)
+    private String sessionId;
+
     @Version
-    private Long version;
+    @Column(name = "version")
+    private Integer version; // Changed from Long to Integer to match CartModel
+
+    @Column(name = "expiry_warning_sent")
+    private Boolean expiryWarningSent = false;
 
     // Custom constructor for proper initialization
     public CartEntity(String userId, String status) {
@@ -45,7 +56,16 @@ public class CartEntity {
         this.status = status;
         this.items = new ArrayList<>();
         this.total = 0.0;
+        this.createdAt = LocalDateTime.now();
         this.lastUpdated = LocalDateTime.now();
+        this.sessionId = generateSessionId();
+        this.version = 0;
+        this.expiryWarningSent = false;
+    }
+
+    // Generate session ID
+    private String generateSessionId() {
+        return "cart_" + java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 16);
     }
 
     // Helper methods to manage bidirectional relationship properly
@@ -114,8 +134,24 @@ public class CartEntity {
     }
 
     @PrePersist
+    public void onCreate() {
+        if (this.createdAt == null) {
+            this.createdAt = LocalDateTime.now();
+        }
+        if (this.lastUpdated == null) {
+            this.lastUpdated = LocalDateTime.now();
+        }
+        if (this.sessionId == null) {
+            this.sessionId = generateSessionId();
+        }
+        if (this.version == null) {
+            this.version = 0;
+        }
+        recalculateTotal();
+    }
+
     @PreUpdate
-    public void updateTimestamp() {
+    public void onUpdate() {
         this.lastUpdated = LocalDateTime.now();
         recalculateTotal();
     }

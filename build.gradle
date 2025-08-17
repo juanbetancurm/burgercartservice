@@ -57,6 +57,21 @@ dependencies {
     // OpenAPI/Swagger dependencies
     implementation 'org.springdoc:springdoc-openapi-ui:1.6.14'
     implementation 'org.springdoc:springdoc-openapi-security:1.6.14'
+
+    // For scheduled tasks
+    implementation 'org.springframework:spring-context'
+
+    // For validation
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+
+    // JSON processing (usually included with spring-boot-starter-web)
+    implementation 'com.fasterxml.jackson.core:jackson-databind'
+
+    // For annotations
+    implementation 'javax.validation:validation-api'
+    annotationProcessor 'org.springframework.boot:spring-boot-configuration-processor'
+    implementation 'javax.validation:validation-api:2.0.1.Final'
+
 }
 
 tasks.named('bootBuildImage') {

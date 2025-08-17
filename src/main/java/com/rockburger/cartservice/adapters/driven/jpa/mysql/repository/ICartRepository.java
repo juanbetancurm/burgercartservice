@@ -6,38 +6,37 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
-import java.util.Optional;
+import java.time.LocalDateTime;
 import java.util.List;
 
 @Repository
 public interface ICartRepository extends JpaRepository<CartEntity, Long> {
 
-    /**
-     * Finds the most recent cart for a user with the specified status
-     * Orders by last updated date descending to get the most recent cart
-     */
-    @Query("SELECT c FROM CartEntity c WHERE c.userId = :userId AND c.status = :status ORDER BY c.lastUpdated DESC")
-    Optional<CartEntity> findByUserIdAndStatusOrderByLastUpdatedDesc(
-            @Param("userId") String userId,
-            @Param("status") String status);
-
-    /**
-     * Finds all carts for a user with the specified status
-     */
+    // Existing methods (keep these)
     List<CartEntity> findByUserIdAndStatus(String userId, String status);
+    boolean existsByUserIdAndStatus(String userId, String status);
+
+    // Add these missing methods:
 
     /**
-     * Finds all carts for a specific user
+     * Find all carts for a specific user
      */
     List<CartEntity> findByUserId(String userId);
 
     /**
-     * Checks if a cart exists for a user with the specified status
+     * Find active carts older than the specified cutoff time
      */
-    boolean existsByUserIdAndStatus(String userId, String status);
+    @Query("SELECT c FROM CartEntity c WHERE c.status = 'ACTIVE' AND c.lastUpdated < :cutoffTime")
+    List<CartEntity> findActiveCartsOlderThan(@Param("cutoffTime") LocalDateTime cutoffTime);
 
     /**
-     * Deletes all carts for a user with the specified status
+     * Count carts by status
      */
-    void deleteByUserIdAndStatus(String userId, String status);
+    long countByStatus(String status);
+
+    /**
+     * Count active carts since a specific date
+     */
+    @Query("SELECT COUNT(c) FROM CartEntity c WHERE c.status = 'ACTIVE' AND c.lastUpdated >= :since")
+    long countActiveCartsSince(@Param("since") LocalDateTime since);
 }

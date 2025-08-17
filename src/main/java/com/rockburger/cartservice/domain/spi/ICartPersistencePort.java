@@ -13,6 +13,6 @@ public interface ICartPersistencePort {
     boolean existsByUserIdAndStatus(String userId, String status);
     void updateCartStatus(String userId, String oldStatus, String newStatus);
 
-    // Maintenance operations
-    void deleteExpiredCarts(int expirationHours);
+    // Enhanced maintenance operations - UPDATED
+    int cleanupExpiredCarts(); // Returns count of cleaned carts
 }
