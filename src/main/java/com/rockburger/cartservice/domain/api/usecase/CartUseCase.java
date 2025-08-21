@@ -9,6 +9,8 @@ import com.rockburger.cartservice.domain.spi.ICartPersistencePort;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.annotation.Isolation;
+import org.springframework.transaction.annotation.Propagation;
 
 import java.time.LocalDateTime;
 import java.util.Optional;
@@ -22,6 +24,8 @@ public class CartUseCase implements ICartServicePort {
     // Cart session management constants
     private static final int CART_EXPIRY_HOURS = 24; // Cart expires after 24 hours
     private static final int CART_WARNING_HOURS = 4; // Warn when cart will expire in 4 hours
+    private static final int MAX_RETRY_ATTEMPTS = 3; // Maximum retry attempts for optimistic locking
+    private static final long RETRY_BASE_DELAY_MS = 100; // Base delay for retries
 
     private final ICartPersistencePort cartPersistencePort;
 
@@ -30,41 +34,57 @@ public class CartUseCase implements ICartServicePort {
     }
 
     @Override
-    @Transactional
+    @Transactional(isolation = Isolation.READ_COMMITTED, propagation = Propagation.REQUIRED)
     public CartModel createCart(String userId) {
         validateUserId(userId);
         logger.info("Creating new cart for user: {}", userId);
 
         try {
-            // First, abandon any existing active carts that might be stale
-            abandonStaleCartsForUser(userId);
-
-            // Check if user already has an active cart after cleanup
-            Optional<CartModel> existingCart = cartPersistencePort.findByUserIdAndStatus(userId, ACTIVE_STATUS);
-            if (existingCart.isPresent()) {
-                CartModel cart = existingCart.get();
-
-                // Check if the existing cart is stale
-                if (isCartStale(cart)) {
-                    logger.info("Found stale cart for user {}, abandoning it", userId);
-                    cart.abandon();
-                    cartPersistencePort.save(cart);
-                } else {
-                    logger.info("User {} already has an active cart with ID {}", userId, cart.getId());
-                    return cart;
-                }
-            }
-
-            // Create and save new cart
-            CartModel newCart = new CartModel(userId);
-            CartModel savedCart = cartPersistencePort.save(newCart);
-            logger.info("Created new cart with ID {} for user {}", savedCart.getId(), userId);
-            return savedCart;
-
+            // Use a more atomic approach to prevent race conditions
+            return createCartWithAtomicCheck(userId);
         } catch (Exception e) {
             logger.error("Error creating new cart for user {}: {}", userId, e.getMessage(), e);
             throw new RuntimeException("Failed to create new cart", e);
         }
+    }
+
+    /**
+     * Atomic cart creation to prevent race conditions
+     */
+    private CartModel createCartWithAtomicCheck(String userId) {
+        // First, try to clean up any stale carts
+        try {
+            abandonStaleCartsForUser(userId);
+        } catch (Exception e) {
+            logger.warn("Failed to clean up stale carts for user {}: {}", userId, e.getMessage());
+            // Continue with cart creation even if cleanup fails
+        }
+
+        // Check for existing active cart after cleanup
+        Optional<CartModel> existingCart = cartPersistencePort.findByUserIdAndStatus(userId, ACTIVE_STATUS);
+        if (existingCart.isPresent()) {
+            CartModel cart = existingCart.get();
+
+            if (isCartStale(cart)) {
+                logger.info("Found stale cart for user {}, abandoning it", userId);
+                try {
+                    cart.abandon();
+                    cartPersistencePort.save(cart);
+                } catch (Exception e) {
+                    logger.warn("Failed to abandon stale cart for user {}: {}", userId, e.getMessage());
+                    // Create new cart anyway
+                }
+            } else {
+                logger.info("User {} already has an active cart with ID {}", userId, cart.getId());
+                return cart;
+            }
+        }
+
+        // Create new cart
+        CartModel newCart = new CartModel(userId);
+        CartModel savedCart = cartPersistencePort.save(newCart);
+        logger.info("Created new cart with ID {} for user {}", savedCart.getId(), userId);
+        return savedCart;
     }
 
     @Override
@@ -85,8 +105,12 @@ public class CartUseCase implements ICartServicePort {
         // Check if cart is stale
         if (isCartStale(cart)) {
             logger.warn("Found stale cart for user {}, abandoning it", userId);
-            cart.abandon();
-            cartPersistencePort.save(cart);
+            try {
+                cart.abandon();
+                cartPersistencePort.save(cart);
+            } catch (Exception e) {
+                logger.error("Failed to abandon stale cart: {}", e.getMessage());
+            }
             throw new CartNotFoundException("Cart has expired, please create a new cart");
         }
 
@@ -100,135 +124,215 @@ public class CartUseCase implements ICartServicePort {
     }
 
     @Override
-    @Transactional
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public CartModel addItem(String userId, CartItemModel item) {
         validateUserId(userId);
-
-        if (item == null) {
-            throw new InvalidParameterException("Cart item cannot be null");
-        }
+        validateCartItem(item);
 
         logger.info("Adding item to cart for user: {} - Article ID: {}, Name: {}, Quantity: {}",
                 userId, item.getArticleId(), item.getArticleName(), item.getQuantity());
 
-        try {
-            // Get or create cart with session validation
-            CartModel cart;
+        return executeWithRetry(
+                () -> addItemWithRetry(userId, item),
+                "add item to cart",
+                userId
+        );
+    }
+
+    /**
+     * Execute operation with retry logic for optimistic locking failures
+     */
+    private <T> T executeWithRetry(SupplierWithException<T> operation, String operationName, String userId) {
+        Exception lastException = null;
+
+        for (int attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
             try {
-                cart = getActiveCartWithSessionValidation(userId);
-                logger.debug("Found existing cart ID {} for user {}", cart.getId(), userId);
-            } catch (CartNotFoundException e) {
-                logger.info("No active cart found for user {}, creating a new one", userId);
-                cart = createCart(userId);
+                return operation.get();
+            } catch (ConcurrentCartModificationException e) {
+                lastException = e;
+                if (attempt == MAX_RETRY_ATTEMPTS) {
+                    logger.error("Failed to {} after {} attempts due to concurrent modification for user {}",
+                            operationName, MAX_RETRY_ATTEMPTS, userId);
+                    break;
+                }
+
+                logger.warn("Optimistic locking failure on attempt {} for user {} during {}, retrying...",
+                        attempt, userId, operationName);
+
+                try {
+                    long delay = RETRY_BASE_DELAY_MS * attempt; // Progressive delay
+                    Thread.sleep(delay);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Interrupted while retrying cart operation", ie);
+                }
+            } catch (CartNotFoundException | CartItemNotFoundException | DuplicateArticleException e) {
+                // These exceptions should not be retried
+                throw e;
+            } catch (Exception e) {
+                logger.error("Error during {} for user {} on attempt {}: {}", operationName, userId, attempt, e.getMessage(), e);
+                throw new RuntimeException("Failed to " + operationName + ": " + e.getMessage(), e);
+            }
+        }
+
+        throw new RuntimeException("Unable to " + operationName + " due to concurrent modifications. Please try again.");
+    }
+
+    private CartModel addItemWithRetry(String userId, CartItemModel item) {
+        logger.debug("Attempting to add item for user: {}", userId);
+
+        // Get or create cart with proper synchronization
+        CartModel cart = getOrCreateCartForOperation(userId);
+
+        // Validate cart state before adding item
+        validateCartForOperation(cart, userId);
+
+        // Check if item already exists in cart
+        boolean itemExists = cart.getItems().stream()
+                .anyMatch(existingItem -> existingItem.getArticleId().equals(item.getArticleId()));
+
+        if (itemExists) {
+            logger.warn("Item with article ID {} already exists in cart for user {}", item.getArticleId(), userId);
+            throw new DuplicateArticleException("Item already exists in cart. Use update quantity instead.");
+        }
+
+        // Add item to cart
+        cart.addItem(item);
+
+        // Save and verify the cart
+        CartModel updatedCart = cartPersistencePort.save(cart);
+
+        // Additional verification
+        if (updatedCart.getItems().isEmpty()) {
+            logger.error("CRITICAL: Cart appears empty after save operation for user {}. This indicates a persistence issue.", userId);
+            throw new RuntimeException("Failed to persist cart items properly");
+        }
+
+        logger.info("Item successfully added to cart for user {}. Cart now has {} items",
+                userId, updatedCart.getItems().size());
+
+        return updatedCart;
+    }
+
+    /**
+     * Get or create cart for operations with proper error handling
+     */
+    private CartModel getOrCreateCartForOperation(String userId) {
+        try {
+            return getActiveCartWithSessionValidation(userId);
+        } catch (CartNotFoundException e) {
+            logger.info("No active cart found for user {}, creating a new one", userId);
+            return createCartForImmediateUse(userId);
+        }
+    }
+
+    /**
+     * Create a cart for immediate use with proper error handling
+     */
+    private CartModel createCartForImmediateUse(String userId) {
+        try {
+            // Clean up stale carts first
+            abandonStaleCartsForUser(userId);
+
+            // Double-check for existing cart after cleanup
+            Optional<CartModel> existingCart = cartPersistencePort.findByUserIdAndStatus(userId, ACTIVE_STATUS);
+            if (existingCart.isPresent()) {
+                CartModel cart = existingCart.get();
+                if (!isCartStale(cart)) {
+                    logger.info("Found existing active cart for user {} during creation", userId);
+                    return cart;
+                }
             }
 
-            // Validate cart state before adding item
-            validateCartForOperation(cart, userId);
+            // Create and save new cart
+            CartModel newCart = new CartModel(userId);
+            CartModel savedCart = cartPersistencePort.save(newCart);
+            logger.info("Created new cart with ID {} for immediate use by user {}", savedCart.getId(), userId);
 
-            // Check if item already exists in cart
-            boolean itemExists = cart.getItems().stream()
-                    .anyMatch(existingItem -> existingItem.getArticleId().equals(item.getArticleId()));
+            return savedCart;
 
-            if (itemExists) {
-                logger.warn("Item with article ID {} already exists in cart for user {}", item.getArticleId(), userId);
-                throw new DuplicateArticleException("Item already exists in cart. Use update quantity instead.");
-            }
-
-            // Add item to cart
-            cart.addItem(item);
-
-            // Save and verify the cart
-            CartModel updatedCart = cartPersistencePort.save(cart);
-
-            // Additional verification
-            if (updatedCart.getItems().isEmpty()) {
-                logger.error("CRITICAL: Cart appears empty after save operation for user {}. This indicates a persistence issue.", userId);
-                throw new RuntimeException("Failed to persist cart items properly");
-            }
-
-            logger.info("Item successfully added to cart for user {}. Cart now has {} items",
-                    userId, updatedCart.getItems().size());
-
-            return updatedCart;
-
-        } catch (DuplicateArticleException e) {
-            // Re-throw business exceptions as-is
-            throw e;
         } catch (Exception e) {
-            logger.error("Error adding item to cart for user {}: {}", userId, e.getMessage(), e);
-            throw new RuntimeException("Failed to add item to cart: " + e.getMessage(), e);
+            logger.error("Error creating cart for immediate use for user {}: {}", userId, e.getMessage(), e);
+            throw new RuntimeException("Failed to create cart for immediate use", e);
         }
     }
 
     @Override
-    @Transactional
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public CartModel updateItemQuantity(String userId, Long articleId, int quantity) {
         validateUserId(userId);
+        validateQuantity(quantity);
         logger.info("Updating item quantity for user: {} and article: {} to quantity: {}", userId, articleId, quantity);
 
-        try {
-            CartModel cart = getActiveCartWithSessionValidation(userId);
-            validateCartForOperation(cart, userId);
+        return executeWithRetry(
+                () -> updateItemQuantityWithRetry(userId, articleId, quantity),
+                "update item quantity",
+                userId
+        );
+    }
 
-            cart.updateItemQuantity(articleId, quantity);
+    private CartModel updateItemQuantityWithRetry(String userId, Long articleId, int quantity) {
+        CartModel cart = getActiveCartWithSessionValidation(userId);
+        validateCartForOperation(cart, userId);
 
-            CartModel updatedCart = cartPersistencePort.save(cart);
-            logger.info("Successfully updated item quantity for user {}", userId);
-            return updatedCart;
+        cart.updateItemQuantity(articleId, quantity);
 
-        } catch (CartNotFoundException | CartItemNotFoundException e) {
-            // Re-throw these specific exceptions
-            throw e;
-        } catch (Exception e) {
-            logger.error("Error updating item quantity for user {}: {}", userId, e.getMessage(), e);
-            throw new RuntimeException("Failed to update item quantity", e);
-        }
+        CartModel updatedCart = cartPersistencePort.save(cart);
+        logger.info("Successfully updated item quantity for user {}", userId);
+        return updatedCart;
     }
 
     @Override
-    @Transactional
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public CartModel removeItem(String userId, Long articleId) {
         validateUserId(userId);
+        validateArticleId(articleId);
         logger.info("Removing item from cart for user: {} and article: {}", userId, articleId);
 
-        try {
-            CartModel cart = getActiveCartWithSessionValidation(userId);
-            validateCartForOperation(cart, userId);
+        return executeWithRetry(
+                () -> removeItemWithRetry(userId, articleId),
+                "remove item from cart",
+                userId
+        );
+    }
 
-            // Check if item exists before attempting removal
-            boolean itemExists = cart.getItems().stream()
-                    .anyMatch(item -> item.getArticleId().equals(articleId));
+    private CartModel removeItemWithRetry(String userId, Long articleId) {
+        CartModel cart = getActiveCartWithSessionValidation(userId);
+        validateCartForOperation(cart, userId);
 
-            if (!itemExists) {
-                logger.warn("Attempt to remove non-existent item {} from cart for user {}", articleId, userId);
-                throw new CartItemNotFoundException("Article not found in cart");
-            }
+        // Check if item exists before attempting removal
+        boolean itemExists = cart.getItems().stream()
+                .anyMatch(item -> item.getArticleId().equals(articleId));
 
-            cart.removeItem(articleId);
-
-            CartModel updatedCart = cartPersistencePort.save(cart);
-            logger.info("Successfully removed item from cart for user {}", userId);
-            return updatedCart;
-
-        } catch (CartNotFoundException | CartItemNotFoundException | InvalidCartOperationException e) {
-            // Re-throw these specific exceptions with proper context
-            throw e;
-        } catch (Exception e) {
-            logger.error("Error removing item from cart for user {}: {}", userId, e.getMessage(), e);
-            throw new RuntimeException("Failed to remove item from cart", e);
+        if (!itemExists) {
+            logger.warn("Attempt to remove non-existent item {} from cart for user {}", articleId, userId);
+            throw new CartItemNotFoundException("Article not found in cart");
         }
+
+        cart.removeItem(articleId);
+
+        CartModel updatedCart = cartPersistencePort.save(cart);
+        logger.info("Successfully removed item from cart for user {}", userId);
+        return updatedCart;
     }
 
     @Override
-    @Transactional
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public void clearCart(String userId) {
         validateUserId(userId);
         logger.info("Clearing cart for user: {}", userId);
 
         try {
-            CartModel cart = getActiveCartWithSessionValidation(userId);
-            cart.clear();
-            cartPersistencePort.save(cart);
+            executeWithRetry(
+                    () -> {
+                        CartModel cart = getActiveCartWithSessionValidation(userId);
+                        cart.clear();
+                        cartPersistencePort.save(cart);
+                        return null;
+                    },
+                    "clear cart",
+                    userId
+            );
             logger.info("Successfully cleared cart for user {}", userId);
         } catch (CartNotFoundException e) {
             logger.info("No active cart found for user {}, nothing to clear", userId);
@@ -239,15 +343,22 @@ public class CartUseCase implements ICartServicePort {
     }
 
     @Override
-    @Transactional
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public void abandonCart(String userId) {
         validateUserId(userId);
         logger.info("Abandoning cart for user: {}", userId);
 
         try {
-            CartModel cart = getActiveCartWithSessionValidation(userId);
-            cart.abandon();
-            cartPersistencePort.save(cart);
+            executeWithRetry(
+                    () -> {
+                        CartModel cart = getActiveCartWithSessionValidation(userId);
+                        cart.abandon();
+                        cartPersistencePort.save(cart);
+                        return null;
+                    },
+                    "abandon cart",
+                    userId
+            );
             logger.info("Successfully abandoned cart for user {}", userId);
         } catch (CartNotFoundException e) {
             logger.info("No active cart found for user {}, nothing to abandon", userId);
@@ -261,6 +372,7 @@ public class CartUseCase implements ICartServicePort {
     @Transactional(readOnly = true)
     public CartModel getCartByUserAndStatus(String userId, String status) {
         validateUserId(userId);
+        validateStatus(status);
         logger.debug("Retrieving cart for user: {} with status: {}", userId, status);
 
         return cartPersistencePort.findByUserIdAndStatus(userId, status)
@@ -284,8 +396,12 @@ public class CartUseCase implements ICartServicePort {
         if (isCartStale(cart)) {
             logger.warn("Cart for user {} is stale (last updated: {}), abandoning it",
                     userId, cart.getLastUpdated());
-            cart.abandon();
-            cartPersistencePort.save(cart);
+            try {
+                cart.abandon();
+                cartPersistencePort.save(cart);
+            } catch (Exception e) {
+                logger.error("Failed to abandon stale cart during validation: {}", e.getMessage());
+            }
             throw new CartNotFoundException("Cart session has expired, please create a new cart");
         }
 
@@ -338,7 +454,7 @@ public class CartUseCase implements ICartServicePort {
     /**
      * Abandon stale carts for a user
      */
-    @Transactional
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void abandonStaleCartsForUser(String userId) {
         try {
             Optional<CartModel> activeCartOpt = cartPersistencePort.findByUserIdAndStatus(userId, ACTIVE_STATUS);
@@ -379,9 +495,56 @@ public class CartUseCase implements ICartServicePort {
         }
     }
 
+    /**
+     * Validation methods
+     */
     private void validateUserId(String userId) {
         if (userId == null || userId.trim().isEmpty()) {
             throw new InvalidParameterException("User ID cannot be empty");
         }
+    }
+
+    private void validateCartItem(CartItemModel item) {
+        if (item == null) {
+            throw new InvalidParameterException("Cart item cannot be null");
+        }
+        if (item.getArticleId() == null) {
+            throw new InvalidParameterException("Article ID cannot be null");
+        }
+        if (item.getQuantity() <= 0) {
+            throw new InvalidParameterException("Quantity must be greater than zero");
+        }
+        if (item.getPrice() < 0) {
+            throw new InvalidParameterException("Price cannot be negative");
+        }
+    }
+
+    private void validateQuantity(int quantity) {
+        if (quantity <= 0) {
+            throw new InvalidParameterException("Quantity must be greater than zero");
+        }
+    }
+
+    private void validateArticleId(Long articleId) {
+        if (articleId == null) {
+            throw new InvalidParameterException("Article ID cannot be null");
+        }
+    }
+
+    private void validateStatus(String status) {
+        if (status == null || status.trim().isEmpty()) {
+            throw new InvalidParameterException("Status cannot be empty");
+        }
+        if (!ACTIVE_STATUS.equals(status) && !ABANDONED_STATUS.equals(status) && !COMPLETED_STATUS.equals(status)) {
+            throw new InvalidParameterException("Invalid status: " + status);
+        }
+    }
+
+    /**
+     * Functional interface for operations that can throw exceptions
+     */
+    @FunctionalInterface
+    private interface SupplierWithException<T> {
+        T get() throws Exception;
     }
 }

@@ -43,7 +43,9 @@ public class JwtCartAuthenticationFilter extends OncePerRequestFilter {
             "/swagger-resources/",
             "/webjars/",
             "/error",
-            "/actuator/health"
+            "/actuator/health",
+            "/actuator/info",
+            "/actuator/prometheus"
     };
 
     public JwtCartAuthenticationFilter(ICartJwtPersistencePort cartJwtPersistencePort) {
@@ -61,9 +63,9 @@ public class JwtCartAuthenticationFilter extends OncePerRequestFilter {
 
         logger.debug("Processing {} request to '{}'", method, requestURI);
 
-        // Skip authentication for public paths
-        if (isPublicPath(requestURI)) {
-            logger.debug("Skipping authentication for public path: {}", requestURI);
+        // Skip authentication for public paths and OPTIONS requests
+        if (isPublicPath(requestURI) || "OPTIONS".equals(method)) {
+            logger.debug("Skipping authentication for public path or OPTIONS request: {} {}", method, requestURI);
             filterChain.doFilter(request, response);
             return;
         }

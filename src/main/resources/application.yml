@@ -27,6 +27,7 @@ logging:
   level:
     org.springframework.security: DEBUG
     com.rockburger.cartservice: DEBUG
+    com.rockburger.cartservice.configuration.security: DEBUG
 
 management:
   endpoints:

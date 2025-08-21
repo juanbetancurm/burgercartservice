@@ -11,9 +11,11 @@ import com.rockburger.cartservice.domain.spi.ICartPersistencePort;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.OptimisticLockingFailureException;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import javax.persistence.OptimisticLockException;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
@@ -31,6 +33,8 @@ public class CartAdapter implements ICartPersistencePort {
     private static final String ABANDONED_STATUS = "ABANDONED";
     private static final String COMPLETED_STATUS = "COMPLETED";
     private static final int CART_EXPIRY_HOURS = 24;
+    private static final int MAX_OPTIMISTIC_LOCK_RETRIES = 3;
+    private static final long RETRY_DELAY_MS = 100;
 
     public CartAdapter(ICartRepository cartRepository, ICartEntityMapper cartEntityMapper) {
         this.cartRepository = cartRepository;
@@ -46,31 +50,174 @@ public class CartAdapter implements ICartPersistencePort {
             // Validate cart before saving
             validateCartForSave(cartModel);
 
-            CartEntity cartEntity = cartEntityMapper.toEntity(cartModel);
-
-            // Handle optimistic locking
-            CartEntity savedEntity;
-            try {
-                savedEntity = cartRepository.save(cartEntity);
-                logger.debug("Successfully saved cart with ID: {}", savedEntity.getId());
-            } catch (OptimisticLockingFailureException e) {
-                logger.warn("Optimistic locking failure for cart user {}: {}", cartModel.getUserId(), e.getMessage());
-                throw new ConcurrentCartModificationException("Cart was modified by another session. Please refresh and try again.");
-            }
-
-            CartModel savedModel = cartEntityMapper.toModel(savedEntity);
-
-            // Log cart summary for debugging
-            logger.debug("Saved cart summary: {}", savedModel.getSummary());
-
-            return savedModel;
+            return saveWithOptimisticLockRetry(cartModel);
 
         } catch (ConcurrentCartModificationException e) {
-            // Re-throw concurrency exceptions
+            // Re-throw concurrency exceptions as-is
             throw e;
         } catch (Exception e) {
             logger.error("Error saving cart for user {}: {}", cartModel.getUserId(), e.getMessage(), e);
             throw new RuntimeException("Failed to save cart", e);
+        }
+    }
+
+    /**
+     * Save cart with automatic retry on optimistic locking failures
+     */
+    private CartModel saveWithOptimisticLockRetry(CartModel cartModel) {
+        Exception lastException = null;
+
+        for (int attempt = 1; attempt <= MAX_OPTIMISTIC_LOCK_RETRIES; attempt++) {
+            try {
+                logger.debug("Attempting to save cart for user {} (attempt {})", cartModel.getUserId(), attempt);
+
+                CartEntity cartEntity = cartEntityMapper.toEntity(cartModel);
+
+                // Special handling for optimistic locking
+                CartEntity savedEntity;
+                try {
+                    savedEntity = cartRepository.save(cartEntity);
+                    logger.debug("Successfully saved cart with ID: {} on attempt {}", savedEntity.getId(), attempt);
+                } catch (ObjectOptimisticLockingFailureException e) {
+                    handleOptimisticLockingFailure(e, cartModel.getUserId(), attempt);
+                    if (attempt == MAX_OPTIMISTIC_LOCK_RETRIES) {
+                        throw new ConcurrentCartModificationException(
+                                "Cart was modified by another session. Please refresh and try again.");
+                    }
+                    waitAndRetry(attempt);
+                    cartModel = refreshCartModelForRetry(cartModel);
+                    continue;
+                } catch (OptimisticLockException e) {
+                    handleOptimisticLockingFailure(e, cartModel.getUserId(), attempt);
+                    if (attempt == MAX_OPTIMISTIC_LOCK_RETRIES) {
+                        throw new ConcurrentCartModificationException(
+                                "Cart was modified by another session. Please refresh and try again.");
+                    }
+                    waitAndRetry(attempt);
+                    cartModel = refreshCartModelForRetry(cartModel);
+                    continue;
+                } catch (OptimisticLockingFailureException e) {
+                    handleOptimisticLockingFailure(e, cartModel.getUserId(), attempt);
+                    if (attempt == MAX_OPTIMISTIC_LOCK_RETRIES) {
+                        throw new ConcurrentCartModificationException(
+                                "Cart was modified by another session. Please refresh and try again.");
+                    }
+                    waitAndRetry(attempt);
+                    cartModel = refreshCartModelForRetry(cartModel);
+                    continue;
+                }
+
+                CartModel savedModel = cartEntityMapper.toModel(savedEntity);
+
+                // Log cart summary for debugging
+                logger.debug("Saved cart summary: User: {}, Items: {}, Status: {}",
+                        savedModel.getUserId(),
+                        savedModel.getItems() != null ? savedModel.getItems().size() : 0,
+                        savedModel.getStatus());
+
+                return savedModel;
+
+            } catch (ObjectOptimisticLockingFailureException e) {
+                lastException = e;
+                logger.warn("Optimistic locking failure on attempt {} for user {}: {}",
+                        attempt, cartModel.getUserId(), e.getMessage());
+                if (attempt == MAX_OPTIMISTIC_LOCK_RETRIES) {
+                    break;
+                }
+            } catch (OptimisticLockException e) {
+                lastException = e;
+                logger.warn("Optimistic lock exception on attempt {} for user {}: {}",
+                        attempt, cartModel.getUserId(), e.getMessage());
+                if (attempt == MAX_OPTIMISTIC_LOCK_RETRIES) {
+                    break;
+                }
+            } catch (OptimisticLockingFailureException e) {
+                lastException = e;
+                logger.warn("Spring optimistic locking failure on attempt {} for user {}: {}",
+                        attempt, cartModel.getUserId(), e.getMessage());
+                if (attempt == MAX_OPTIMISTIC_LOCK_RETRIES) {
+                    break;
+                }
+            } catch (Exception e) {
+                logger.error("Unexpected error on attempt {} for user {}: {}",
+                        attempt, cartModel.getUserId(), e.getMessage(), e);
+                throw e;
+            }
+        }
+
+        // If we get here, all retry attempts failed
+        logger.error("Failed to save cart after {} attempts for user {}",
+                MAX_OPTIMISTIC_LOCK_RETRIES, cartModel.getUserId());
+        throw new ConcurrentCartModificationException(
+                "Unable to save cart due to concurrent modifications. Please refresh and try again.");
+    }
+
+    /**
+     * Wait before retry with exponential backoff
+     */
+    private void waitAndRetry(int attempt) {
+        try {
+            Thread.sleep(RETRY_DELAY_MS * attempt);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Save operation interrupted", ie);
+        }
+    }
+
+    /**
+     * Handle optimistic locking failure with detailed logging
+     */
+    private void handleOptimisticLockingFailure(Exception e, String userId, int attempt) {
+        String errorDetails = extractOptimisticLockErrorDetails(e);
+        logger.warn("Optimistic locking failure for cart user {} on attempt {}: {} - Details: {}",
+                userId, attempt, e.getMessage(), errorDetails);
+    }
+
+    /**
+     * Extract meaningful details from optimistic locking exceptions
+     */
+    private String extractOptimisticLockErrorDetails(Exception e) {
+        StringBuilder details = new StringBuilder();
+
+        if (e instanceof ObjectOptimisticLockingFailureException) {
+            ObjectOptimisticLockingFailureException ex = (ObjectOptimisticLockingFailureException) e;
+            details.append("Object: ").append(ex.getPersistentClassName());
+            if (ex.getIdentifier() != null) {
+                details.append(", ID: ").append(ex.getIdentifier());
+            }
+        } else if (e instanceof OptimisticLockException) {
+            OptimisticLockException ex = (OptimisticLockException) e;
+            if (ex.getEntity() != null) {
+                details.append("Entity: ").append(ex.getEntity().getClass().getSimpleName());
+            }
+        } else if (e instanceof OptimisticLockingFailureException) {
+            details.append("Spring OptimisticLockingFailureException");
+        }
+
+        return details.toString();
+    }
+
+    /**
+     * Refresh cart model for retry attempt
+     */
+    private CartModel refreshCartModelForRetry(CartModel cartModel) {
+        try {
+            // Try to fetch the latest version of the cart from database
+            Optional<CartModel> latestCart = findByUserIdAndStatus(cartModel.getUserId(), cartModel.getStatus());
+
+            if (latestCart.isPresent()) {
+                logger.debug("Refreshed cart model for retry - found existing cart with ID: {}",
+                        latestCart.get().getId());
+                return latestCart.get();
+            } else {
+                logger.debug("No existing cart found during refresh, will create new one");
+                // Return the original model but reset ID to null for fresh creation
+                cartModel.setId(null);
+                return cartModel;
+            }
+        } catch (Exception e) {
+            logger.warn("Failed to refresh cart model for retry, using original: {}", e.getMessage());
+            return cartModel;
         }
     }
 
@@ -100,20 +247,35 @@ public class CartAdapter implements ICartPersistencePort {
             CartEntity cartEntity = cartEntities.get(0);
             CartModel cartModel = cartEntityMapper.toModel(cartEntity);
 
-            // Check if cart is expired and handle accordingly
-            if (cartModel.isExpired() && ACTIVE_STATUS.equals(status)) {
+            // Fixed: Check if cart entity is expired (using entity's lastUpdated field)
+            if (isCartEntityExpired(cartEntity) && ACTIVE_STATUS.equals(status)) {
                 logger.info("Found expired active cart for user {}, abandoning it", userId);
                 abandonExpiredCart(cartEntity);
                 return Optional.empty();
             }
 
-            logger.debug("Found cart: {}", cartModel.getSummary());
+            logger.debug("Found cart: User: {}, Items: {}, Status: {}",
+                    cartModel.getUserId(),
+                    cartModel.getItems() != null ? cartModel.getItems().size() : 0,
+                    cartModel.getStatus());
             return Optional.of(cartModel);
 
         } catch (Exception e) {
             logger.error("Error finding cart for user {} with status {}: {}", userId, status, e.getMessage(), e);
             return Optional.empty();
         }
+    }
+
+    /**
+     * Fixed: Check if cart entity is expired using entity's timestamp
+     */
+    private boolean isCartEntityExpired(CartEntity cartEntity) {
+        if (cartEntity.getLastUpdated() == null) {
+            return true; // Consider null timestamps as expired
+        }
+
+        LocalDateTime expiryThreshold = LocalDateTime.now().minusHours(CART_EXPIRY_HOURS);
+        return cartEntity.getLastUpdated().isBefore(expiryThreshold);
     }
 
     @Override
@@ -137,14 +299,78 @@ public class CartAdapter implements ICartPersistencePort {
                     logger.debug("Deleting cart ID {} with status {} for user {}",
                             cart.getId(), cart.getStatus(), userId));
 
-            // Delete all carts for the user
-            cartRepository.deleteAll(userCarts);
+            // Delete all carts for the user with retry logic for optimistic locking
+            deleteCartsWithRetry(userCarts, userId);
 
             logger.info("Successfully deleted {} cart(s) for user: {}", userCarts.size(), userId);
 
         } catch (Exception e) {
             logger.error("Error deleting carts for user {}: {}", userId, e.getMessage(), e);
             throw new RuntimeException("Failed to delete carts for user", e);
+        }
+    }
+
+    /**
+     * Delete carts with retry logic for optimistic locking failures
+     */
+    private void deleteCartsWithRetry(List<CartEntity> userCarts, String userId) {
+        for (CartEntity cart : userCarts) {
+            boolean deleted = false;
+            Exception lastException = null;
+
+            for (int attempt = 1; attempt <= MAX_OPTIMISTIC_LOCK_RETRIES && !deleted; attempt++) {
+                try {
+                    cartRepository.delete(cart);
+                    deleted = true;
+                    logger.debug("Successfully deleted cart ID {} on attempt {}", cart.getId(), attempt);
+                } catch (ObjectOptimisticLockingFailureException e) {
+                    lastException = e;
+                    logger.warn("Optimistic locking failure deleting cart ID {} on attempt {}: {}",
+                            cart.getId(), attempt, e.getMessage());
+                    handleDeleteRetry(cart, attempt);
+                } catch (OptimisticLockException e) {
+                    lastException = e;
+                    logger.warn("Optimistic lock exception deleting cart ID {} on attempt {}: {}",
+                            cart.getId(), attempt, e.getMessage());
+                    handleDeleteRetry(cart, attempt);
+                } catch (OptimisticLockingFailureException e) {
+                    lastException = e;
+                    logger.warn("Spring optimistic locking failure deleting cart ID {} on attempt {}: {}",
+                            cart.getId(), attempt, e.getMessage());
+                    handleDeleteRetry(cart, attempt);
+                } catch (Exception e) {
+                    logger.error("Unexpected error deleting cart ID {}: {}", cart.getId(), e.getMessage());
+                    throw e;
+                }
+            }
+
+            if (!deleted) {
+                logger.error("Failed to delete cart ID {} after {} attempts due to optimistic locking",
+                        cart.getId(), MAX_OPTIMISTIC_LOCK_RETRIES);
+                // Continue with other carts rather than failing the entire operation
+            }
+        }
+    }
+
+    /**
+     * Handle retry logic for delete operations
+     */
+    private void handleDeleteRetry(CartEntity cart, int attempt) {
+        if (attempt < MAX_OPTIMISTIC_LOCK_RETRIES) {
+            try {
+                Thread.sleep(RETRY_DELAY_MS * attempt);
+                // Refresh the entity for retry
+                Optional<CartEntity> refreshedCart = cartRepository.findById(cart.getId());
+                if (refreshedCart.isPresent()) {
+                    cart = refreshedCart.get();
+                } else {
+                    // Cart was already deleted by another transaction
+                    logger.info("Cart ID {} was already deleted by another transaction", cart.getId());
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Delete operation interrupted", ie);
+            }
         }
     }
 
@@ -187,15 +413,8 @@ public class CartAdapter implements ICartPersistencePort {
 
             int updatedCount = 0;
             for (CartEntity cart : carts) {
-                cart.setStatus(newStatus);
-                cart.setLastUpdated(LocalDateTime.now());
-
-                try {
-                    cartRepository.save(cart);
+                if (updateCartStatusWithRetry(cart, newStatus)) {
                     updatedCount++;
-                    logger.debug("Updated cart ID {} status to {}", cart.getId(), newStatus);
-                } catch (Exception e) {
-                    logger.error("Failed to update cart ID {} status: {}", cart.getId(), e.getMessage());
                 }
             }
 
@@ -205,6 +424,58 @@ public class CartAdapter implements ICartPersistencePort {
         } catch (Exception e) {
             logger.error("Error updating cart status for user {}: {}", userId, e.getMessage(), e);
             throw new RuntimeException("Failed to update cart status", e);
+        }
+    }
+
+    /**
+     * Update cart status with retry logic for optimistic locking
+     */
+    private boolean updateCartStatusWithRetry(CartEntity cart, String newStatus) {
+        for (int attempt = 1; attempt <= MAX_OPTIMISTIC_LOCK_RETRIES; attempt++) {
+            try {
+                cart.setStatus(newStatus);
+                cart.setLastUpdated(LocalDateTime.now());
+                cartRepository.save(cart);
+                logger.debug("Updated cart ID {} status to {} on attempt {}", cart.getId(), newStatus, attempt);
+                return true;
+            } catch (ObjectOptimisticLockingFailureException e) {
+                handleStatusUpdateRetry(cart, attempt, e);
+            } catch (OptimisticLockException e) {
+                handleStatusUpdateRetry(cart, attempt, e);
+            } catch (OptimisticLockingFailureException e) {
+                handleStatusUpdateRetry(cart, attempt, e);
+            } catch (Exception e) {
+                logger.error("Unexpected error updating cart ID {} status: {}", cart.getId(), e.getMessage());
+                return false;
+            }
+        }
+
+        logger.error("Failed to update cart ID {} status after {} attempts",
+                cart.getId(), MAX_OPTIMISTIC_LOCK_RETRIES);
+        return false;
+    }
+
+    /**
+     * Handle retry logic for status update operations
+     */
+    private void handleStatusUpdateRetry(CartEntity cart, int attempt, Exception e) {
+        logger.warn("Optimistic locking failure updating cart ID {} status on attempt {}: {}",
+                cart.getId(), attempt, e.getMessage());
+
+        if (attempt < MAX_OPTIMISTIC_LOCK_RETRIES) {
+            try {
+                Thread.sleep(RETRY_DELAY_MS * attempt);
+                // Refresh the entity
+                Optional<CartEntity> refreshedCart = cartRepository.findById(cart.getId());
+                if (refreshedCart.isPresent()) {
+                    cart = refreshedCart.get();
+                } else {
+                    logger.warn("Cart ID {} no longer exists", cart.getId());
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Update operation interrupted", ie);
+            }
         }
     }
 
@@ -230,15 +501,9 @@ public class CartAdapter implements ICartPersistencePort {
 
             int cleanedCount = 0;
             for (CartEntity cart : expiredCarts) {
-                try {
-                    cart.setStatus(ABANDONED_STATUS);
-                    cart.setLastUpdated(LocalDateTime.now());
-                    cartRepository.save(cart);
+                if (updateCartStatusWithRetry(cart, ABANDONED_STATUS)) {
                     cleanedCount++;
-
                     logger.debug("Abandoned expired cart ID {} for user {}", cart.getId(), cart.getUserId());
-                } catch (Exception e) {
-                    logger.error("Failed to abandon expired cart ID {}: {}", cart.getId(), e.getMessage());
                 }
             }
 
@@ -248,32 +513,6 @@ public class CartAdapter implements ICartPersistencePort {
         } catch (Exception e) {
             logger.error("Error during expired cart cleanup: {}", e.getMessage(), e);
             return 0;
-        }
-    }
-
-    /**
-     * Get cart statistics for monitoring
-     */
-    @Transactional(readOnly = true)
-    public CartStatistics getCartStatistics() {
-        logger.debug("Retrieving cart statistics");
-
-        try {
-            long activeCount = cartRepository.countByStatus(ACTIVE_STATUS);
-            long abandonedCount = cartRepository.countByStatus(ABANDONED_STATUS);
-            long completedCount = cartRepository.countByStatus(COMPLETED_STATUS);
-
-            LocalDateTime oneDayAgo = LocalDateTime.now().minusHours(24);
-            long recentActiveCount = cartRepository.countActiveCartsSince(oneDayAgo);
-
-            CartStatistics stats = new CartStatistics(activeCount, abandonedCount, completedCount, recentActiveCount);
-            logger.debug("Cart statistics: {}", stats);
-
-            return stats;
-
-        } catch (Exception e) {
-            logger.error("Error retrieving cart statistics: {}", e.getMessage(), e);
-            return new CartStatistics(0, 0, 0, 0);
         }
     }
 
@@ -288,16 +527,11 @@ public class CartAdapter implements ICartPersistencePort {
 
         CartEntity latestCart = sortedCarts.get(0);
 
-        // Mark older carts as abandoned
+        // Mark older carts as abandoned with retry logic
         for (int i = 1; i < sortedCarts.size(); i++) {
             CartEntity oldCart = sortedCarts.get(i);
-            try {
-                oldCart.setStatus(ABANDONED_STATUS);
-                oldCart.setLastUpdated(LocalDateTime.now());
-                cartRepository.save(oldCart);
+            if (updateCartStatusWithRetry(oldCart, ABANDONED_STATUS)) {
                 logger.info("Abandoned duplicate cart ID {} for user {}", oldCart.getId(), userId);
-            } catch (Exception e) {
-                logger.error("Failed to abandon duplicate cart ID {}: {}", oldCart.getId(), e.getMessage());
             }
         }
 
@@ -305,16 +539,14 @@ public class CartAdapter implements ICartPersistencePort {
     }
 
     /**
-     * Abandon an expired cart
+     * Abandon an expired cart with retry logic
      */
     private void abandonExpiredCart(CartEntity cartEntity) {
-        try {
-            cartEntity.setStatus(ABANDONED_STATUS);
-            cartEntity.setLastUpdated(LocalDateTime.now());
-            cartRepository.save(cartEntity);
+        if (updateCartStatusWithRetry(cartEntity, ABANDONED_STATUS)) {
             logger.info("Abandoned expired cart ID {} for user {}", cartEntity.getId(), cartEntity.getUserId());
-        } catch (Exception e) {
-            logger.error("Failed to abandon expired cart ID {}: {}", cartEntity.getId(), e.getMessage());
+        } else {
+            logger.error("Failed to abandon expired cart ID {} for user {}",
+                    cartEntity.getId(), cartEntity.getUserId());
         }
     }
 
@@ -326,8 +558,8 @@ public class CartAdapter implements ICartPersistencePort {
             throw new IllegalArgumentException("Cart model cannot be null");
         }
 
-        if (!cartModel.isValid()) {
-            throw new IllegalArgumentException("Cart model is not valid: " + cartModel.getSummary());
+        if (cartModel.getUserId() == null || cartModel.getUserId().trim().isEmpty()) {
+            throw new IllegalArgumentException("Cart model must have a valid user ID");
         }
 
         validateUserId(cartModel.getUserId());
@@ -353,34 +585,6 @@ public class CartAdapter implements ICartPersistencePort {
 
         if (!ACTIVE_STATUS.equals(status) && !ABANDONED_STATUS.equals(status) && !COMPLETED_STATUS.equals(status)) {
             throw new IllegalArgumentException("Invalid status: " + status);
-        }
-    }
-
-    /**
-     * Cart statistics data class
-     */
-    public static class CartStatistics {
-        private final long activeCount;
-        private final long abandonedCount;
-        private final long completedCount;
-        private final long recentActiveCount;
-
-        public CartStatistics(long activeCount, long abandonedCount, long completedCount, long recentActiveCount) {
-            this.activeCount = activeCount;
-            this.abandonedCount = abandonedCount;
-            this.completedCount = completedCount;
-            this.recentActiveCount = recentActiveCount;
-        }
-
-        public long getActiveCount() { return activeCount; }
-        public long getAbandonedCount() { return abandonedCount; }
-        public long getCompletedCount() { return completedCount; }
-        public long getRecentActiveCount() { return recentActiveCount; }
-
-        @Override
-        public String toString() {
-            return String.format("CartStatistics[active=%d, abandoned=%d, completed=%d, recentActive=%d]",
-                    activeCount, abandonedCount, completedCount, recentActiveCount);
         }
     }
 }
